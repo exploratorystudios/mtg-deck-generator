@@ -37,14 +37,6 @@ From the repo root:
 python3 mtg_gui.py
 ```
 
-## Data
-
-The generator prefers the bundled archive:
-
-- `data/cards_commander.json`
-
-If that file is present, the app does not need `cards/commander/`.
-
 ## Notes
 
 - The app is built for Commander / EDH only.
