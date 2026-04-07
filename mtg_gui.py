@@ -792,7 +792,7 @@ class ManaCurveChart(QWidget):
 
     def set_data(self, curve: dict[int, int], archetype: str, curve_targets: dict | None = None):
         self.curve = curve
-        raw = curve_targets if curve_targets is not None else dg.ARCHETYPE_CONFIG[archetype]["curve_targets"]
+        raw = curve_targets if curve_targets is not None else dgc.ARCHETYPE_CONFIG[archetype]["curve_targets"]
         ideal_total = sum(raw.values())
         actual_total = max(sum(curve.values()), 1)
         self.ideal = {k: round(v / ideal_total * actual_total) for k, v in raw.items()}
@@ -2708,7 +2708,7 @@ class DeckViewerTab(QWidget):
                 (nm, card) for nm, card in nl_seen.items()
                 if nm not in assigned and predicate(card.get("type_line") or "")
             ]
-            for nm, card in sorted(group_cards, key=lambda t: (dg.get_cmc(t[1]), t[0])):
+            for nm, card in sorted(group_cards, key=lambda t: (dgc.get_cmc(t[1]), t[0])):
                 entries.append((group_label, card, nl_counts[nm]))
                 assigned.add(nm)
 
@@ -4201,9 +4201,6 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("MTG Commander Generator")
     app.setStyleSheet(STYLESHEET)
-
-    # High-DPI
-    app.setAttribute(Qt.AA_UseHighDpiPixmaps)
 
     window = MainWindow()
     window.show()
