@@ -2327,12 +2327,11 @@ class MagicCardWidget(QWidget):
     def _load_face_image(self) -> None:
         """Request the small (thumbnail) image for the current face."""
         self._small_px = None
-        if _HAS_INTERNET:
-            face = _get_card_face(self.card, self._face_idx)
-            self._normal_url = _get_image_uri(face, "normal", self._face_idx)
-            small_url = _get_image_uri(face, "small", self._face_idx)
-            if small_url:
-                request_image(small_url, self._on_small_loaded)
+        face = _get_card_face(self.card, self._face_idx)
+        self._normal_url = _get_image_uri(face, "normal", self._face_idx)
+        small_url = _get_image_uri(face, "small", self._face_idx)
+        if small_url:
+            request_image(small_url, self._on_small_loaded)
 
     def _on_small_loaded(self, px: "QPixmap | None") -> None:
         if px and not px.isNull():
@@ -2496,7 +2495,7 @@ class CardDetailWidget(QWidget):
 
     def _load_face(self):
         self._normal_px = None
-        if self._card and _HAS_INTERNET:
+        if self._card:
             face = _get_card_face(self._card, self._face_idx)
             url = _get_image_uri(face, "normal", self._face_idx)
             if url:
