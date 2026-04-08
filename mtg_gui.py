@@ -2978,7 +2978,6 @@ class GeneratorWorker(QThread):
                 / max(len(selected_nonlands), 1)
             )
             deck_text_plain = dg.format_mtga(selected_nonlands, selected_lands)
-            deck_text_arena = dg.format_mtga_arena(selected_nonlands, selected_lands)
 
             result = {
                 "nonlands":     selected_nonlands,
@@ -2991,7 +2990,6 @@ class GeneratorWorker(QThread):
                 "avg_cmc":      avg_cmc,
                 "avg_power":    avg_power,
                 "deck_text":    deck_text_plain,
-                "deck_text_arena": deck_text_arena,
                 "total_cards":  len(selected_nonlands) + len(selected_lands),
                 "archetype":    arch,
                 "colors":       sorted(colors),
@@ -3161,7 +3159,6 @@ class BrawlGeneratorWorker(QThread):
             )
 
             deck_text_plain = dgb.format_brawl(commander, selected_nonlands, selected_lands)
-            deck_text_arena = dgb.format_brawl_arena(commander, selected_nonlands, selected_lands)
 
             result = {
                 "mode":          "brawl",
@@ -3177,7 +3174,6 @@ class BrawlGeneratorWorker(QThread):
                 "avg_cmc":       avg_cmc,
                 "avg_power":     avg_power,
                 "deck_text":     deck_text_plain,
-                "deck_text_arena": deck_text_arena,
                 "total_cards":   1 + len(selected_nonlands) + len(selected_lands),
                 "archetype":     arch,
                 "colors":        sorted(colors),
@@ -3353,7 +3349,6 @@ class CommanderGeneratorWorker(QThread):
             )
 
             deck_text_plain = dgc.format_commander(commander, selected_nonlands, selected_lands)
-            deck_text_arena = dgc.format_commander_arena(commander, selected_nonlands, selected_lands)
 
             result = {
                 "mode":          "commander",
@@ -3371,7 +3366,6 @@ class CommanderGeneratorWorker(QThread):
                 "avg_cmc":       avg_cmc,
                 "avg_power":     avg_power,
                 "deck_text":     deck_text_plain,
-                "deck_text_arena": deck_text_arena,
                 "total_cards":   1 + len(selected_nonlands) + len(selected_lands),
                 "archetype":     arch,
                 "colors":        sorted(colors),
@@ -4057,18 +4051,12 @@ class RightPanel(QWidget):
         dl.setContentsMargins(12, 12, 12, 12)
         dl.setSpacing(8)
 
-        # Export format toolbar
+        # Deck list toolbar
         fmt_bar = QHBoxLayout()
         fmt_bar.setSpacing(10)
-        fmt_lbl = QLabel("Export Format:")
+        fmt_lbl = QLabel("Deck List")
         fmt_lbl.setStyleSheet("color: #8b949e; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;")
-        self._fmt_control = SegmentedControl([
-            ("Plain  (N Card Name)", "plain"),
-            ("MTGA  (N Card Name (SET) #)", "arena"),
-        ])
-        self._fmt_control.option_changed.connect(self._on_format_changed)
         fmt_bar.addWidget(fmt_lbl)
-        fmt_bar.addWidget(self._fmt_control)
         fmt_bar.addStretch()
 
         # Card count info label
@@ -4080,9 +4068,7 @@ class RightPanel(QWidget):
         self.deck_text = QTextEdit()
         self.deck_text.setReadOnly(True)
         self.deck_text.setPlaceholderText(
-            "Generate a deck to see the card list here.\n\n"
-            "Plain format works everywhere; MTGA format includes set codes\n"
-            "and collector numbers for direct in-game import."
+            "Generate a deck to see the card list here."
         )
         DeckHighlighter(self.deck_text.document())
         dl.addWidget(self.deck_text)
@@ -4091,19 +4077,13 @@ class RightPanel(QWidget):
         self._deck_viewer = DeckViewerTab()
         self.tabs.addTab(self._deck_viewer, "  Deck Viewer  ")
 
-        self._deck_texts: dict[str, str] = {"plain": "", "arena": ""}
+        self._deck_texts: dict[str, str] = {"plain": ""}
 
         # ── Placeholder / Empty State ──────────────────────────────────────
         self._show_placeholder()
 
-    def _on_format_changed(self, fmt: str):
-        text = self._deck_texts.get(fmt, "")
-        if text:
-            self.deck_text.setPlainText(text)
-
     def active_deck_text(self) -> str:
-        """Returns whichever format is currently displayed."""
-        return self._deck_texts.get(self._fmt_control.current(), "")
+        return self._deck_texts.get("plain", "")
 
     def _show_placeholder(self):
         self.curve_chart.curve = {}
@@ -4213,10 +4193,9 @@ class RightPanel(QWidget):
             rl.addStretch()
             self.tribe_layout.addWidget(row)
 
-        # Deck texts (both formats)
+        # Deck text
         self._deck_texts["plain"] = result["deck_text"]
-        self._deck_texts["arena"] = result.get("deck_text_arena", result["deck_text"])
-        self.deck_text.setPlainText(self._deck_texts[self._fmt_control.current()])
+        self.deck_text.setPlainText(self._deck_texts["plain"])
 
         # Info label
         n_unique = result.get("card_count", 0)

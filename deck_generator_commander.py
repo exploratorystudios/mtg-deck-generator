@@ -5909,8 +5909,6 @@ def main() -> None:
                         help="Evolutionary refinement generations (default: 200)")
     parser.add_argument("--diversity", type=float, default=1.0,
                         help="Diversity/noise level 0.0–3.0 (default: 1.0)")
-    parser.add_argument("--arena", action="store_true",
-                        help="Output in MTGA Arena format with set codes")
     parser.add_argument("--candidate-decks", type=int, default=6,
                         help="Number of candidate deck shapes to explore before selecting the best (default: 6)")
 
@@ -6040,10 +6038,7 @@ def main() -> None:
     )
 
     # ── Output ───────────────────────────────────────────────────────────────
-    if args.arena:
-        deck_text = format_commander_arena(commander, selected_nonlands, selected_lands)
-    else:
-        deck_text = format_commander(commander, selected_nonlands, selected_lands)
+    deck_text = format_commander(commander, selected_nonlands, selected_lands)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
@@ -6239,7 +6234,6 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
         "avg_cmc": sum(get_cmc(c) for c in selected_nonlands) / max(len(selected_nonlands), 1),
         "avg_power": sum(score_power(c) for c in selected_nonlands) / max(len(selected_nonlands), 1),
         "deck_text": format_commander(commander, selected_nonlands, selected_lands),
-        "deck_text_arena": format_commander_arena(commander, selected_nonlands, selected_lands),
         "total_cards": 1 + len(selected_nonlands) + len(selected_lands),
         "archetype": arch,
         "colors": sorted(colors),
