@@ -29,6 +29,7 @@ import sys
 from collections import Counter, defaultdict
 
 from deck_requirements import (
+    CREATURE_TYPES,
     build_deck_state,
     commander_role_penalty,
     deck_requirement_penalty,
@@ -278,6 +279,86 @@ def extract_strategy_terms(strategy_text: str) -> list[str]:
     return [tok for tok in re.split(r"[,\s]+", text) if tok]
 
 
+_TRIBE_TOKEN_OVERRIDES: dict[str, str] = {
+    "elves": "elf",
+    "faeries": "faerie",
+    "wolves": "wolf",
+}
+_NON_TRIBE_STRATEGY_TOKENS: frozenset[str] = frozenset(
+    {
+        "tribal", "tribes", "aggro", "midrange", "control", "combo", "tempo",
+        "ramp", "draw", "removal", "interaction", "spells", "spell", "tokens",
+        "graveyard", "artifact", "artifacts", "enchantment", "enchantments",
+        "voltron", "storm", "stax", "lifegain", "drain", "burn",
+    }
+    | set(STRATEGY_ORACLE_ALIASES.keys())
+    | set(STRATEGY_TYPE_ALIASES.keys())
+    | set(STRATEGY_KEYWORD_EXPANSIONS.keys())
+)
+
+
+def _strategy_token_to_tribe(token: str) -> str | None:
+    tok = (token or "").strip().lower()
+    if not tok:
+        return None
+    if tok in CREATURE_TYPES:
+        return tok
+    mapped = _TRIBE_TOKEN_OVERRIDES.get(tok)
+    if mapped and mapped in CREATURE_TYPES:
+        return mapped
+    if tok.endswith("s") and tok[:-1] in CREATURE_TYPES:
+        return tok[:-1]
+    # Fallback for tribes not in the curated CREATURE_TYPES subset (e.g. Centaur):
+    # accept a plain alphabetic token that is not a known strategy term.
+    if tok.isalpha() and len(tok) >= 3 and tok not in _NON_TRIBE_STRATEGY_TOKENS:
+        singular = tok[:-1] if tok.endswith("s") and len(tok) > 3 else tok
+        if singular not in _NON_TRIBE_STRATEGY_TOKENS:
+            return singular
+    return None
+
+
+def apply_strategy_tribal_mode(
+    plan_profile: dict[str, object] | None,
+    strategy_text: str,
+) -> dict[str, object]:
+    """
+    If user strategy includes 'tribal'/'tribes' + a recognized creature type,
+    enable normal tribal plan steering (not strict tribal filtering).
+    """
+    terms = extract_strategy_terms(strategy_text)
+    if not terms:
+        return dict(plan_profile or {})
+    if not any(t in {"tribal", "tribes"} for t in terms):
+        return dict(plan_profile or {})
+
+    strategy_tribe: str | None = None
+    for tok in terms:
+        tribe = _strategy_token_to_tribe(tok)
+        if tribe:
+            strategy_tribe = tribe
+            break
+    if not strategy_tribe:
+        return dict(plan_profile or {})
+
+    profile = dict(plan_profile or {})
+    plans = set(profile.get("plans", frozenset()))
+    plans.add("tribal_synergy")
+    profile["plans"] = frozenset(plans)
+    profile["primary_tribe"] = strategy_tribe
+
+    tribe_tag = f"tribe_{strategy_tribe}"
+    required_tags = dict(profile.get("required_tags", {}))
+    required_tags[tribe_tag] = max(required_tags.get(tribe_tag, 0), 20)
+    required_tags["draw"] = max(required_tags.get("draw", 0), 4)
+    required_tags["removal"] = max(required_tags.get("removal", 0), 5)
+    profile["required_tags"] = required_tags
+
+    finisher_tags = set(profile.get("finisher_tags", frozenset({"wincon"})))
+    finisher_tags.update({tribe_tag, "anthem", "wincon"})
+    profile["finisher_tags"] = frozenset(finisher_tags)
+    return profile
+
+
 def _expand_strategy_keyword(word: str, seen: set[str] | None = None) -> list[str]:
     seen = seen or set()
     wl = word.lower().strip()
@@ -475,6 +556,35 @@ def get_all_commanders(db: dict) -> list[dict]:
     )
 
 
+def _extract_primary_tribe(type_line: str) -> str | None:
+    """Extract first meaningful creature subtype token from a type line."""
+    _noise = {"the", "and", "of"}
+    for face_type in (type_line or "").lower().split("//"):
+        if "—" not in face_type:
+            continue
+        subtype_part = face_type.split("—", 1)[1].strip()
+        for st in subtype_part.split():
+            st = st.strip().lower()
+            if st and len(st) > 2 and st not in _noise:
+                return st
+    return None
+
+
+def _commander_tribal_signaled(oracle: str, primary_tribe: str | None) -> bool:
+    """Whether commander text explicitly indicates tribe-matters gameplay."""
+    if not primary_tribe:
+        return False
+    tribe_pat = re.escape(primary_tribe)
+    if re.search(rf"\b{tribe_pat}s?\b", oracle):
+        return True
+    if re.search(
+        r"choose a creature type|of the chosen type|share a creature type|creatures? of the chosen type",
+        oracle,
+    ):
+        return True
+    return False
+
+
 def commander_auto_strategy(commander: dict, ignore_tribal: bool = False) -> str:
     """
     Derive automatic strategy keywords from the commander's type line and oracle text.
@@ -485,15 +595,12 @@ def commander_auto_strategy(commander: dict, ignore_tribal: bool = False) -> str
     oracle    = (commander.get("oracle_text") or "").lower()
     keywords  = [k.lower() for k in (commander.get("keywords") or [])]
 
-    # Creature subtypes → tribal hint (e.g. "Goblin Shaman" → "goblin")
+    # Tribal subtype hints are only added when the commander text explicitly
+    # signals tribe-matters gameplay. A bare subtype alone should not steer.
     if not ignore_tribal:
-        for face_type in type_line.split("//"):
-            if "—" in face_type:
-                for st in face_type.split("—", 1)[1].strip().split():
-                    st = st.strip().lower()
-                    # Skip noise words and very short tokens
-                    if st and len(st) > 2 and st not in {"the", "and", "of"}:
-                        hints.add(st)
+        primary_tribe = _extract_primary_tribe(type_line)
+        if _commander_tribal_signaled(oracle, primary_tribe) and primary_tribe:
+            hints.add(primary_tribe)
 
     # Mechanic detection from oracle text.
     # Keep this intentionally conservative: auto-strategy should describe the
@@ -508,7 +615,7 @@ def commander_auto_strategy(commander: dict, ignore_tribal: bool = False) -> str
         hints.add("counters")
     if re.search(r"whenever you gain life|you gain \d+ life", oracle):
         hints.add("lifegain")
-    if re.search(r"whenever you cast an? (?:instant|sorcery|spell)|magecraft|prowess|copy target spell", oracle):
+    if re.search(r"whenever you cast (?:an? )?(?:instant|sorcery|noncreature|spell)|magecraft|prowess|copy target spell", oracle):
         hints.add("spells")
     if re.search(r"artifact spells? you cast|whenever .{0,30}artifact enters|artifacts? you control|affinity for artifacts|improvise", oracle):
         hints.add("artifacts")
@@ -678,29 +785,8 @@ def infer_commander_plan(commander: dict | None) -> dict[str, object]:
     # Tribal plan: only infer tribe when the commander text actually signals
     # tribe-matters gameplay. A bare creature subtype (e.g. Centaur/Wizard) is
     # not enough by itself.
-    primary_tribe: str | None = None
-    _noise = {"the", "and", "of"}
-    for face_type in type_line.split("//"):
-        if "—" in face_type:
-            subtype_part = face_type.split("—", 1)[1].strip()
-            for st in subtype_part.split():
-                st = st.strip().lower()
-                if st and len(st) > 2 and st not in _noise:
-                    primary_tribe = st
-                    break
-        if primary_tribe:
-            break
-
-    tribal_signaled = False
-    if primary_tribe:
-        tribe_pat = re.escape(primary_tribe)
-        if re.search(rf"\b{tribe_pat}s?\b", oracle):
-            tribal_signaled = True
-        elif re.search(
-            r"choose a creature type|of the chosen type|share a creature type|creatures? of the chosen type",
-            oracle,
-        ):
-            tribal_signaled = True
+    primary_tribe = _extract_primary_tribe(type_line)
+    tribal_signaled = _commander_tribal_signaled(oracle, primary_tribe)
 
     if primary_tribe and tribal_signaled:
         tribe_tag = f"tribe_{primary_tribe}"
@@ -1093,6 +1179,31 @@ def _tribal_member_target(plan_profile: dict[str, object] | None, default: int =
     return max(6, int(redundancy_targets.get(tribe_tag, default)))
 
 
+def _scaled_tribal_target(base_target: int, tribal_alignment: float, plans: frozenset[str]) -> int:
+    """
+    Scale tribal density target by how often tribe cards also advance non-tribal
+    core plans. Poor overlap means lower target to avoid subtype-only filler.
+    """
+    base_target = max(0, int(base_target))
+    if base_target <= 0:
+        return 0
+    nontribal = set(plans) - {"tribal_synergy"}
+    if not nontribal:
+        return base_target
+    factor = 1.0
+    if tribal_alignment < 0.25:
+        factor = 0.55
+    elif tribal_alignment < 0.40:
+        factor = 0.68
+    elif tribal_alignment < 0.55:
+        factor = 0.82
+    elif tribal_alignment < 0.70:
+        factor = 0.92
+    scaled = int(math.ceil(base_target * factor))
+    floor = 6 if "tribal_synergy" in plans else 0
+    return max(floor, min(base_target, scaled))
+
+
 def _tribal_alignment_ratio(
     primary_tribe: str | None,
     plans: list[str],
@@ -1188,6 +1299,7 @@ def choose_active_packages(
             "secondary_plan": None,
             "allowed_tags": frozenset(),
             "discouraged_tags": frozenset(),
+            "tribal_alignment": 1.0,
         }
 
     primary_tribe: str | None = (plan_profile or {}).get("primary_tribe")
@@ -1227,6 +1339,7 @@ def choose_active_packages(
             "secondary_plan": None,
             "allowed_tags": frozenset(),
             "discouraged_tags": frozenset(),
+            "tribal_alignment": tribal_alignment,
         }
 
     scored_plans.sort(reverse=True)
@@ -1255,6 +1368,7 @@ def choose_active_packages(
         "secondary_plan": secondary,
         "allowed_tags": frozenset(allowed_tags),
         "discouraged_tags": frozenset(discouraged_tags),
+        "tribal_alignment": tribal_alignment,
     }
 
 
@@ -3406,20 +3520,24 @@ def deck_synergy_total(
 
     plans = frozenset((plan_profile or {}).get("plans", frozenset()))
     tribal_enabled = "tribal_synergy" in plans
+    primary_tribe: str | None = (plan_profile or {}).get("primary_tribe")
+    deck_cards = [db.get(name, {}) for name in deck_names if name in db]
+    tribal_alignment = _tribal_alignment_ratio(primary_tribe, list(plans), deck_cards, tag_index)
     if tribal_enabled:
+        tribal_scale = 0.40 + 0.60 * max(0.0, min(1.0, tribal_alignment))
         tribe_score = sum(
-            math.log(max(cnt, 1)) * 0.8
+            math.log(max(cnt, 1)) * 0.8 * tribal_scale
             for _sub, cnt in tribe_counter.items()
             if cnt >= 6
         )
         if tribe_counter:
             top_tribe_count = tribe_counter.most_common(1)[0][1]
             if top_tribe_count >= 20:
-                tribe_score += 6.0
+                tribe_score += 6.0 * tribal_scale
             elif top_tribe_count >= 15:
-                tribe_score += 3.5
+                tribe_score += 3.5 * tribal_scale
             elif top_tribe_count >= 10:
-                tribe_score += 1.5
+                tribe_score += 1.5 * tribal_scale
     else:
         # Tiny residual signal for natural subtype concentration, but not enough
         # to drag non-tribal decks toward low-impact tribe filler.
@@ -4112,6 +4230,13 @@ def select_nonlands(
     package_profile = choose_active_packages(plan_profile, filtered, tag_index)
     allowed_package_tags: frozenset[str] = frozenset(package_profile.get("allowed_tags", frozenset()))
     discouraged_package_tags: frozenset[str] = frozenset(package_profile.get("discouraged_tags", frozenset()))
+    _tribal_alignment = float(package_profile.get("tribal_alignment", 1.0))
+    if (not strict_tribal) and primary_tribe and "tribal_synergy" in active_plans:
+        _tribe_tag_runtime = f"tribe_{primary_tribe}"
+        _base_target = int(redundancy_targets.get(_tribe_tag_runtime, 0))
+        if _base_target > 0:
+            _scaled_target = _scaled_tribal_target(_base_target, _tribal_alignment, active_plans)
+            redundancy_targets[_tribe_tag_runtime] = min(_base_target, _scaled_target)
     _tribal_tension = (
         not strict_tribal
         and primary_tribe is not None
@@ -4121,6 +4246,15 @@ def select_nonlands(
     _tribe_tag = f"tribe_{primary_tribe}" if primary_tribe else ""
     _nontribal_core_tags: frozenset[str] = frozenset(
         t for t in core_tags if not t.startswith("tribe_")
+    )
+    _nontribal_support_tags: frozenset[str] = frozenset(
+        t for t in support_tags if not t.startswith("tribe_")
+    )
+    _nontribal_finisher_tags: frozenset[str] = frozenset(
+        t for t in finisher_tags if not t.startswith("tribe_")
+    )
+    _nontribal_plan_tags: frozenset[str] = (
+        _nontribal_core_tags | _nontribal_support_tags | _nontribal_finisher_tags
     )
 
     # ── Strategy bonus ────────────────────────────────────────────────────────
@@ -4389,6 +4523,13 @@ def select_nonlands(
             have = selected_tag_counts.get(tag, 0)
             if have < need and tag in card_tags:
                 scale = 0.9 if tag in core_tags else 0.45
+                if tag.startswith("tribe_") and not strict_tribal:
+                    # Tribe membership alone is low-signal in multi-plan shells;
+                    # prioritize tribe cards that also move non-tribal engine tags.
+                    if card_tags & _nontribal_plan_tags:
+                        scale *= 0.95
+                    else:
+                        scale *= 0.24
                 bonus += (need - have) * scale
         if len(selected_names) >= max(10, nonland_slots // 2):
             if any(t in card_tags for t in finisher_tags):
@@ -4430,10 +4571,17 @@ def select_nonlands(
                 for t in _nontribal_core_tags
             )
             contributes_nontribal = bool(card_tags & _nontribal_core_tags)
+            contributes_nontribal_any = bool(card_tags & _nontribal_plan_tags)
             if contributes_nontribal:
                 bonus += min(1.4, 0.30 + unmet_nontribal * 0.06)
             elif unmet_nontribal > 0:
                 bonus -= min(3.0, 0.45 + unmet_nontribal * 0.12)
+            tribe_have = selected_tag_counts.get(_tribe_tag, 0)
+            tribe_target = max(6, int(redundancy_targets.get(_tribe_tag, 6)))
+            tribal_grace = max(4, min(8, tribe_target // 2))
+            if not contributes_nontribal_any and tribe_have >= tribal_grace:
+                over = tribe_have - tribal_grace + 1
+                bonus -= min(4.2, 0.85 + over * 0.30)
         if active_plans & {"spells_velocity", "spell_cost_engine"}:
             spells_need = max(
                 0,
@@ -4585,6 +4733,18 @@ def select_nonlands(
             _floor = max(0, (_comp_need + 1) // 2 - _have)  # fill up to half
             if _floor <= 0:
                 continue
+
+            def _passes_tribal_quality_gate(_card_obj: dict) -> bool:
+                if not (_tribal_tension and _tribe_tag and _label == "tribe_members"):
+                    return True
+                _ctags = tag_index.get(_card_obj.get("name", ""), frozenset())
+                if _tribe_tag not in _ctags:
+                    return False
+                if _ctags & _nontribal_plan_tags:
+                    return True
+                _roles = set(classify_roles(_card_obj))
+                return bool(_roles & {"draw", "removal", "ramp", "counterspell", "tutor", "wincon"})
+
             _p0_candidates = sorted(
                 (
                     (sc + _selection_need_bonus(c["name"]), c)
@@ -4592,6 +4752,7 @@ def select_nonlands(
                     if tag_index.get(c.get("name", ""), frozenset()) & _comp_tags
                     and c.get("name") not in copy_counts
                     and c.get("name") != commander_name
+                    and _passes_tribal_quality_gate(c)
                 ),
                 key=lambda x: -x[0],
             )
@@ -4855,6 +5016,14 @@ def deck_fitness(
     core_tags: frozenset[str] = frozenset(priority_profile.get("core_tags", frozenset()))
     support_tags: frozenset[str] = frozenset(priority_profile.get("support_tags", frozenset()))
     redundancy_targets: dict[str, int] = dict(priority_profile.get("redundancy_targets", {}))
+    active_plans: frozenset[str] = frozenset(plan_profile.get("plans", frozenset()))
+    primary_tribe: str | None = plan_profile.get("primary_tribe")
+    if primary_tribe and "tribal_synergy" in active_plans:
+        _tribe_tag = f"tribe_{primary_tribe}"
+        _base_target = int(redundancy_targets.get(_tribe_tag, 0))
+        if _base_target > 0:
+            _align = _tribal_alignment_ratio(primary_tribe, list(active_plans), cards, tag_index)
+            redundancy_targets[_tribe_tag] = _scaled_tribal_target(_base_target, _align, active_plans)
     requirement_penalty = deck_requirement_penalty(
         cards,
         tag_index,
@@ -4921,7 +5090,6 @@ def deck_fitness(
     plan_penalty += structure_report["penalty"]
     if structure_report["hard_fail"]:
         plan_penalty += 10.0
-    active_plans: frozenset[str] = frozenset(plan_profile.get("plans", frozenset()))
     if active_plans & {"spells_velocity", "spell_cost_engine"}:
         creature_count = sum(1 for c in cards if is_creature(c))
         spell_creature_cap = 14 if {"spells_velocity", "spell_cost_engine"} <= active_plans else 16
@@ -5950,6 +6118,7 @@ def main() -> None:
     plan_profile = infer_commander_plan(commander)
     if args.ignore_tribal:
         plan_profile = remove_tribal_plan_bias(plan_profile)
+    plan_profile = apply_strategy_tribal_mode(plan_profile, args.strategy)
     if auto:
         print(f"  Auto-strategy: {auto}", file=sys.stderr)
     if plan_profile.get("plans"):
@@ -6103,6 +6272,7 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
     plan_profile = infer_commander_plan(commander)
     if ignore_tribal:
         plan_profile = remove_tribal_plan_bias(plan_profile)
+    plan_profile = apply_strategy_tribal_mode(plan_profile, strat)
 
     # If the user specified a tribe override, inject it into the plan profile
     # so all downstream scoring treats it as the primary tribe.
