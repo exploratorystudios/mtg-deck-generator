@@ -41,6 +41,12 @@ COMMANDER_DECK_SIZE = 100   # total including commander
 COMMANDER_MAIN_SIZE = 99    # cards in the 99 (not commander)
 _GOLDFISH_CACHE: dict[tuple, dict[str, float]] = {}
 _NUMBER_WORD_RE = r"(?:\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|x|\w+)"
+_ETB_RE = r"enters(?: the battlefield)?"
+_LTB_RE = r"leaves(?: the battlefield)?"
+_DIES_RE = r"(?:dies|is put into a graveyard from the battlefield)"
+_COLOR_WORDS = frozenset({
+    "white", "blue", "black", "red", "green", "colorless", "multicolored",
+})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,7 +75,7 @@ STRATEGY_ORACLE_ALIASES: dict[str, list[str]] = {
     "reanimator":  [r"return target .* card from (a|your) graveyard", r"put .* from (a|your) graveyard (onto|into) the battlefield"],
     "reanimation": [r"return target .* card from (a|your) graveyard", r"put .* from (a|your) graveyard (onto|into) the battlefield"],
     "recursion":   [r"return (target |a |each )?.* from (a|your|their) graveyard", r"from the graveyard to (the|your) hand"],
-    "etb":         [r"when(ever)? .{0,40} enters( the battlefield)?", r"enters with"],
+    "etb":         [rf"when(ever)? .{{0,40}} {_ETB_RE}", r"enters with"],
     "blink":       [r"exile .{0,40}(then return|return it)", r"return it to the battlefield", r"flicker"],
     "flicker":     [r"exile .{0,40}(then return|return it)", r"return it to the battlefield", r"flicker"],
     "looting":     [r"draw (a|\d+) card.{0,30}discard", r"discard .{0,30}draw (a|\d+) card"],
@@ -78,8 +84,8 @@ STRATEGY_ORACLE_ALIASES: dict[str, list[str]] = {
     "infinite":    [r"untap .{0,30}(add|mana)", r"take an extra (turn|step)", r"create \d+ cop"],
     "tokens":      [r"create (a|an|\d+) .{0,30}token", r"token creature", r"creature token"],
     "graveyard":   [r"graveyard"],
-    "sacrifice":   [r"sacrifice (a|an|target|\{0,20})", r"when .{0,60} dies", r"when .{0,60} is put into"],
-    "death_trigger":[r"when(?:ever)? .{0,60} dies", r"dies,? ", r"whenever .{0,60}is put into a graveyard"],
+    "sacrifice":   [r"sacrifice (a|an|target|\{0,20})", rf"when .{{0,60}} {_DIES_RE}", r"when .{0,60} is put into"],
+    "death_trigger":[rf"when(?:ever)? .{{0,60}} {_DIES_RE}", r"dies,? ", r"whenever .{0,60}is put into a graveyard"],
     "bounce":      [r"return target .{0,30} to (its owner.s hand|your hand|their hand)"],
     "counter":     [r"counter target (spell|ability|creature spell|noncreature spell)"],
     "removal":     [r"destroy target", r"exile target", r"target creature gets? -\d+/-\d+", r"deals? \d+ damage to target"],
@@ -341,6 +347,8 @@ def apply_strategy_tribal_mode(
         return dict(plan_profile or {})
 
     profile = dict(plan_profile or {})
+    profile["strategy_tribal_requested"] = True
+    profile["strategy_tribe"] = strategy_tribe
     plans = set(profile.get("plans", frozenset()))
     plans.add("tribal_synergy")
     profile["plans"] = frozenset(plans)
@@ -348,7 +356,8 @@ def apply_strategy_tribal_mode(
 
     tribe_tag = f"tribe_{strategy_tribe}"
     required_tags = dict(profile.get("required_tags", {}))
-    required_tags[tribe_tag] = max(required_tags.get(tribe_tag, 0), 20)
+    # User-requested tribal should be strongly represented even in mixed plans.
+    required_tags[tribe_tag] = max(required_tags.get(tribe_tag, 0), 16)
     required_tags["draw"] = max(required_tags.get("draw", 0), 4)
     required_tags["removal"] = max(required_tags.get("removal", 0), 5)
     profile["required_tags"] = required_tags
@@ -605,7 +614,7 @@ def commander_auto_strategy(commander: dict, ignore_tribal: bool = False) -> str
     # Mechanic detection from oracle text.
     # Keep this intentionally conservative: auto-strategy should describe the
     # commander's primary engine, not every incidental rider in the textbox.
-    if re.search(r"sacrifice (another|a|an|target)|whenever .{0,30} you control dies", oracle):
+    if re.search(rf"sacrifice (another|a|an|target)|whenever .{{0,30}} you control {_DIES_RE}", oracle):
         hints.add("sacrifice")
     if re.search(r"from your graveyard|return .{0,30} graveyard|cast .{0,30} from your graveyard|whenever .{0,30} leaves your graveyard", oracle):
         hints.add("graveyard")
@@ -623,9 +632,9 @@ def commander_auto_strategy(commander: dict, ignore_tribal: bool = False) -> str
         hints.add("enchantments")
     if re.search(r"whenever .{0,30}land enters|landfall", oracle):
         hints.add("landfall")
-    if re.search(r"enters the battlefield|whenever .{0,30} enters the battlefield|flicker|blink", oracle):
+    if re.search(rf"{_ETB_RE}|whenever .{{0,30}} {_ETB_RE}|flicker|blink", oracle):
         hints.add("etb")
-    if re.search(r"whenever a creature dies|whenever .{0,30} dies", oracle):
+    if re.search(rf"whenever a creature {_DIES_RE}|whenever .{{0,30}} {_DIES_RE}", oracle):
         hints.add("sacrifice")
 
     return " ".join(sorted(hints))
@@ -686,7 +695,7 @@ def infer_commander_plan(commander: dict | None) -> dict[str, object]:
     # "whenever .* dies" (death triggers), or explicit sacrifice-outlet patterns.
     if re.search(
         r"from (a |your |their )?graveyard"           # casting/returning from GY
-        r"|whenever .{0,30} dies"                      # death trigger on the commander
+        rf"|whenever .{{0,30}} {_DIES_RE}"             # death trigger on the commander
         r"|sacrifice (a |an |target )"                 # sacrifice outlet
         r"|when .{0,30} is put into .{0,15}graveyard", # explicit GY payoff
         oracle,
@@ -772,7 +781,7 @@ def infer_commander_plan(commander: dict | None) -> dict[str, object]:
             finisher_tags.discard("modified_payoff")
             finisher_tags.discard("counters")
 
-    if re.search(r"whenever a creature enters|enters the battlefield|flicker|blink", oracle):
+    if re.search(rf"whenever a creature {_ETB_RE}|{_ETB_RE}|flicker|blink", oracle):
         add_plan(
             "etb_value",
             {
@@ -1147,6 +1156,13 @@ _TRIBAL_STRONG_ANTAGONIST_PLANS = frozenset({
     "spells_velocity",
     "spell_cost_engine",
 })
+_TRIBAL_COMPLEMENTARY_PLANS = frozenset({
+    "go_wide_tokens",
+    "counters_engine",
+    "etb_value",
+    "combat_damage_engine",
+    "midrange_value",
+})
 _TRIBAL_ORTHOGONAL_PLANS = frozenset({
     "lands_engine",
     "artifact_engine",
@@ -1165,9 +1181,54 @@ def _tribal_cap_for_plans(plans: frozenset[str]) -> int:
         return 20
     if nontribal & _TRIBAL_STRONG_ANTAGONIST_PLANS:
         return 8
-    if nontribal & _TRIBAL_ORTHOGONAL_PLANS:
-        return 10
-    return 12
+    cap = 12
+    cap += min(4, 2 * len(nontribal & _TRIBAL_COMPLEMENTARY_PLANS))
+    cap -= min(2, len(nontribal & _TRIBAL_ORTHOGONAL_PLANS))
+    return max(8, min(16, cap))
+
+
+def _tribal_progress_score(
+    tribe_count: int,
+    token_tribe_count: int,
+    token_weight: float = 0.65,
+) -> float:
+    """Effective tribal progress: direct tribe members + discounted tribe token-makers."""
+    return float(tribe_count) + float(token_tribe_count) * float(token_weight)
+
+
+def _token_tribes_from_tags(tags: frozenset[str] | set[str]) -> frozenset[str]:
+    return frozenset(
+        t[len("token_tribe_"):]
+        for t in tags
+        if isinstance(t, str) and t.startswith("token_tribe_")
+    )
+
+
+def _infer_structural_tribes(
+    tag_counts: Counter,
+    subtype_counts: Counter,
+    plan_profile: dict[str, object] | None,
+) -> frozenset[str]:
+    """
+    Infer tribes that are structurally central to the current deck shell.
+    Uses both explicit plan intent and observed subtype/tag concentration.
+    """
+    expected: set[str] = set()
+    plans = frozenset((plan_profile or {}).get("plans", frozenset()))
+    primary_tribe: str | None = (plan_profile or {}).get("primary_tribe")
+    if primary_tribe and "tribal_synergy" in plans:
+        expected.add(primary_tribe)
+    for tag, cnt in tag_counts.items():
+        if not str(tag).startswith("tribe_"):
+            continue
+        tribe = str(tag)[6:]
+        threshold = 4 if primary_tribe and tribe == primary_tribe else 6
+        if int(cnt) >= threshold:
+            expected.add(tribe)
+    for subtype, cnt in subtype_counts.items():
+        if int(cnt) >= 6:
+            expected.add(str(subtype))
+    return frozenset(expected)
 
 
 def _tribal_member_target(plan_profile: dict[str, object] | None, default: int = 20) -> int:
@@ -1246,6 +1307,7 @@ def derive_priority_profile(plan_profile: dict[str, object] | None) -> dict[str,
     required_tags = dict((plan_profile or {}).get("required_tags", {}))
     finisher_tags = set((plan_profile or {}).get("finisher_tags", frozenset({"wincon"})))
     primary_tribe: str | None = (plan_profile or {}).get("primary_tribe")
+    explicit_tribal = bool((plan_profile or {}).get("strategy_tribal_requested"))
     core_tags: set[str] = set()
     support_tags: set[str] = set()
     redundancy_targets: dict[str, int] = dict(required_tags)
@@ -1263,7 +1325,7 @@ def derive_priority_profile(plan_profile: dict[str, object] | None) -> dict[str,
             # When tribal is one plan among several, scale back the tribe density
             # target so it doesn't crowd out the other plan's engine pieces.
             # Solo tribal → 20 members; shared plan → 12 (healthy presence, not a flood).
-            tribe_target = 12 if is_multi_plan else 20
+            tribe_target = (16 if is_multi_plan else 20) if explicit_tribal else (12 if is_multi_plan else 20)
             redundancy_targets[tribe_tag] = max(redundancy_targets.get(tribe_tag, 0), tribe_target)
         else:
             core_tags.update(rule["core_tags"])
@@ -1272,7 +1334,7 @@ def derive_priority_profile(plan_profile: dict[str, object] | None) -> dict[str,
         for tag, count in rule["redundancy"].items():
             redundancy_targets[tag] = max(redundancy_targets.get(tag, 0), count)
     # Cap tribal density based on how antagonistic companion plans are.
-    if is_multi_plan and primary_tribe:
+    if is_multi_plan and primary_tribe and not explicit_tribal:
         tribe_tag = f"tribe_{primary_tribe}"
         if tribe_tag in redundancy_targets:
             cap = _tribal_cap_for_plans(plans)
@@ -1303,6 +1365,7 @@ def choose_active_packages(
         }
 
     primary_tribe: str | None = (plan_profile or {}).get("primary_tribe")
+    explicit_tribal = bool((plan_profile or {}).get("strategy_tribal_requested"))
     pool_counts = _tag_counter_from_cards(candidate_cards, tag_index)
     tribal_alignment = _tribal_alignment_ratio(primary_tribe, plans, candidate_cards, tag_index)
     scored_plans: list[tuple[float, str]] = []
@@ -1324,7 +1387,12 @@ def choose_active_packages(
                 have = pool_counts.get(tag, 0)
                 score += min(1.0, have / max(1, target))
         score += 0.35 * sum(pool_counts.get(tag, 0) > 0 for tag in rule["closure_tags"])
-        if plan == "tribal_synergy" and "tribal_synergy" in plans and len(plans) > 1:
+        if (
+            plan == "tribal_synergy"
+            and "tribal_synergy" in plans
+            and len(plans) > 1
+            and not explicit_tribal
+        ):
             if tribal_alignment < 0.25:
                 score *= 0.48
             elif tribal_alignment < 0.40:
@@ -1621,6 +1689,23 @@ def get_subtypes(card: dict) -> set[str]:
     return cleaned
 
 
+def extract_token_subtypes(oracle: str) -> set[str]:
+    """
+    Infer creature subtypes created by token-making text.
+    Example: "create a 1/1 green Elf Warrior creature token" -> {"elf", "warrior"}.
+    """
+    found: set[str] = set()
+    text = (oracle or "").lower()
+    for m in re.finditer(r"create [^.\n]{0,140}? creature token", text):
+        segment = m.group(0)
+        for tok in re.findall(r"[a-z][a-z-]*", segment):
+            if tok in CREATURE_TYPES:
+                found.add(tok)
+            elif tok.endswith("s") and tok[:-1] in CREATURE_TYPES:
+                found.add(tok[:-1])
+    return found
+
+
 def fits_colors(card: dict, allowed: set[str]) -> bool:
     """True if the card's color identity is a subset of allowed colors + colorless."""
     return fits_color_identity(card, allowed)
@@ -1656,8 +1741,8 @@ _TUTOR_PATTERNS = re.compile(
 )
 _COUNTER_PATTERNS = re.compile(r"counter target (?:spell|instant|sorcery|creature spell|activated)")
 _THREAT_TEXT_PATTERNS = re.compile(
-    r"deals? \d+ damage|target opponent|each opponent|can't block|can't attack"
-    r"|draw a card|return target|destroy target|exile target|whenever .* dies"
+    rf"deals? \d+ damage|target opponent|each opponent|can't block|can't attack"
+    rf"|draw a card|return target|destroy target|exile target|whenever .* {_DIES_RE}"
 )
 
 _MILL_RE = re.compile(
@@ -1850,15 +1935,26 @@ def detect_synergy_tags(card: dict) -> frozenset[str]:
     # Tokens
     if "create" in oracle and "token" in oracle:
         tags.add("token_maker")
-    if re.search(r"whenever a creature enters|whenever a token|for each creature you control", oracle):
+        if "creature token" in oracle:
+            tags.add("token_creature_maker")
+        for tok_sub in extract_token_subtypes(oracle):
+            tags.add(f"token_tribe_{tok_sub}")
+    if re.search(rf"whenever a creature {_ETB_RE}|whenever a token|for each creature you control", oracle):
         tags.add("token_payoff")
+    if re.search(
+        r"deals? \d+ damage to each creature with flying"
+        r"|destroy all creatures with flying"
+        r"|each creature with flying gets -",
+        oracle,
+    ):
+        tags.add("anti_flying_sweeper")
 
     # Sacrifice
     if "sacrifice" in oracle:
         tags.add("sacrifice")
     if re.search(r"sacrifice [^.\n]{0,40}:", oracle):
         tags.add("sac_outlet")
-    if re.search(r"when(?:ever)? .{0,60} dies", oracle):
+    if re.search(rf"when(?:ever)? .{{0,60}} {_DIES_RE}", oracle):
         tags.add("death_trigger")
 
     # Artifacts
@@ -1892,11 +1988,30 @@ def detect_synergy_tags(card: dict) -> frozenset[str]:
     if any(val >= 2 for val in count_pips(card.get("mana_cost") or "").values()):
         tags.add("heavy_pips")
 
+    # Keyword-gated shells
+    if "toxic" in keywords or re.search(r"\btoxic \d+\b", oracle):
+        tags.add("toxic_enabler")
+    if re.search(r"creatures? you control with toxic|with toxic (?:gets|get)", oracle):
+        tags.add("toxic_payoff")
+    if "defender" in keywords or re.search(r"\bdefender\b", oracle):
+        tags.add("defender_enabler")
+    if re.search(
+        r"creatures? you control with defender"
+        r"|with defender assigns combat damage"
+        r"|as though (?:it|they) didn.t have defender",
+        oracle,
+    ):
+        tags.add("defender_payoff")
+
     # ETB
-    if is_creature(card) and re.search(r"when .{0,30} enters", oracle):
+    if is_creature(card) and re.search(rf"when .{{0,30}} {_ETB_RE}", oracle):
         tags.add("etb_trigger")
-    if "whenever a creature enters" in oracle:
+    if re.search(rf"whenever a creature {_ETB_RE}", oracle):
         tags.add("etb_payoff")
+    if is_creature(card) and re.search(rf"when .{{0,30}} {_LTB_RE}|until .{{0,40}} {_LTB_RE}", oracle):
+        tags.add("ltb_trigger")
+    if re.search(rf"whenever a creature {_LTB_RE}", oracle):
+        tags.add("ltb_payoff")
     if re.search(r"exile .{0,40} then return|blink|flicker", oracle):
         tags.add("blink_enabler")
 
@@ -2205,7 +2320,7 @@ def score_constructed_playability(card: dict) -> float:
     # --- Negative: parasitic / build-around-only ---
     if re.search(r"\bfate counter\b|\bstory circle\b|\bpayoff only if\b", oracle):
         score -= 0.5
-    if re.search(r"\bcards? with the same name\b|\bother cards? named\b", oracle):
+    if re.search(r"\bcards? with the same name\b|\bother cards? named\b|\bcards? named\b", oracle):
         score -= 1.2
     # Un-set / acorn stamp already filtered; this catches edge cases
     if re.search(r"\bacorn\b", oracle) and "acorn" not in (card.get("name") or "").lower():
@@ -2261,6 +2376,8 @@ SYNERGY_PAIRS: list[tuple[str, str]] = [
     ("enchantment",      "enchantment_payoff"),
     ("etb_trigger",      "etb_payoff"),
     ("etb_trigger",      "blink_enabler"),
+    ("ltb_trigger",      "blink_enabler"),
+    ("ltb_trigger",      "etb_trigger"),
     ("death_trigger",    "sacrifice"),
     ("treasure_maker",   "artifact_payoff"),
     ("surveil_payoff",   "surveil_enabler"),
@@ -2292,6 +2409,7 @@ SUPPORT_PAIR_WEIGHTS: list[tuple[str, str, int, int, float]] = [
     ("self_mill", "graveyard_payoff", 4, 4, 1.3),
     ("graveyard_enabler", "graveyard_payoff", 6, 5, 1.4),
     ("blink_enabler", "etb_trigger", 3, 8, 1.3),
+    ("blink_enabler", "ltb_trigger", 3, 4, 1.0),
     ("spells_enabler", "spells_payoff", 12, 4, 1.25),
     ("combat_damage_trigger", "evasion", 4, 8, 1.2),
     ("landfall", "extra_land_drop", 5, 3, 1.2),
@@ -2301,6 +2419,8 @@ SUPPORT_PAIR_WEIGHTS: list[tuple[str, str, int, int, float]] = [
 TENSION_PAIR_WEIGHTS: list[tuple[str, str, int, int, float]] = [
     ("token_maker", "sweeper", 6, 3, 1.35),
     ("voltron_enabler", "sweeper", 5, 3, 1.1),
+    ("anti_flying_sweeper", "evasion", 1, 8, 1.9),
+    ("anti_flying_sweeper", "tribe_bird", 1, 6, 2.3),
     ("spells_enabler", "threat", 12, 24, 1.0),
     ("counterspell", "threat", 8, 24, 0.9),
     ("graveyard_payoff", "graveyard_hate", 4, 2, 1.6),
@@ -2777,6 +2897,8 @@ PAYOFF_ENABLER_PAIRS: list[tuple[str, str]] = [
     ("equipment_payoff", "equipment"),
     ("token_payoff",     "token_maker"),
     ("draw_payoff",      "graveyard_enabler"),
+    ("toxic_payoff",     "toxic_enabler"),
+    ("defender_payoff",  "defender_enabler"),
 ]
 
 # Narrow mechanics with explicit support requirements. These are the places
@@ -2817,6 +2939,16 @@ NARROW_MECHANIC_RULES: dict[str, dict[str, object]] = {
         "support_tags": frozenset({"party_cleric", "party_rogue", "party_warrior", "party_wizard"}),
         "payoff_tags": frozenset({"party_payoff"}),
         "min_support": 3,
+    },
+    "toxic": {
+        "support_tags": frozenset({"toxic_enabler"}),
+        "payoff_tags": frozenset({"toxic_payoff"}),
+        "min_support": 4,
+    },
+    "defender": {
+        "support_tags": frozenset({"defender_enabler"}),
+        "payoff_tags": frozenset({"defender_payoff"}),
+        "min_support": 5,
     },
 }
 
@@ -2990,7 +3122,7 @@ def detect_liability_flags(card: dict) -> frozenset[str]:
         flags.add("land_sacrifice")
     if re.search(r"sacrifice all (?:permanents|creatures) you control", oracle):
         flags.add("self_wipe")
-    if re.search(r"when(?:ever)? .{0,60}(?:enters the battlefield|deals combat damage).{0,50}sacrifice", oracle):
+    if re.search(rf"when(?:ever)? .{{0,60}}(?:{_ETB_RE}|deals combat damage).{{0,50}}sacrifice", oracle):
         flags.add("forced_sacrifice")
     if re.search(r"when(?:ever)? .{0,30} enters.{0,40}sacrifice (?:a|an|another) ", oracle) and "you may" not in oracle:
         flags.add("etb_sacrifice")
@@ -4181,6 +4313,7 @@ def select_nonlands(
     required_tags: dict[str, int] = dict(plan_profile.get("required_tags", {}))
     finisher_tags: frozenset[str] = frozenset(plan_profile.get("finisher_tags", frozenset({"wincon"})))
     primary_tribe: str | None = plan_profile.get("primary_tribe")
+    explicit_tribal = bool((plan_profile or {}).get("strategy_tribal_requested"))
     active_plans: frozenset[str] = frozenset(plan_profile.get("plans", frozenset()))
     priority_profile = derive_priority_profile(plan_profile)
     core_tags: frozenset[str] = frozenset(priority_profile.get("core_tags", frozenset()))
@@ -4231,7 +4364,7 @@ def select_nonlands(
     allowed_package_tags: frozenset[str] = frozenset(package_profile.get("allowed_tags", frozenset()))
     discouraged_package_tags: frozenset[str] = frozenset(package_profile.get("discouraged_tags", frozenset()))
     _tribal_alignment = float(package_profile.get("tribal_alignment", 1.0))
-    if (not strict_tribal) and primary_tribe and "tribal_synergy" in active_plans:
+    if (not strict_tribal) and primary_tribe and "tribal_synergy" in active_plans and not explicit_tribal:
         _tribe_tag_runtime = f"tribe_{primary_tribe}"
         _base_target = int(redundancy_targets.get(_tribe_tag_runtime, 0))
         if _base_target > 0:
@@ -4239,11 +4372,13 @@ def select_nonlands(
             redundancy_targets[_tribe_tag_runtime] = min(_base_target, _scaled_target)
     _tribal_tension = (
         not strict_tribal
+        and not explicit_tribal
         and primary_tribe is not None
         and "tribal_synergy" in active_plans
         and len(active_plans) > 1
     )
     _tribe_tag = f"tribe_{primary_tribe}" if primary_tribe else ""
+    _token_tribe_tag = f"token_tribe_{primary_tribe}" if primary_tribe else ""
     _nontribal_core_tags: frozenset[str] = frozenset(
         t for t in core_tags if not t.startswith("tribe_")
     )
@@ -4357,6 +4492,19 @@ def select_nonlands(
         if active_plans & {"spells_velocity", "spell_cost_engine"} and is_creature(card):
             if not (card_tags & frozenset({"spells_payoff", "cost_reduction", "draw", "treasure_maker"})):
                 struct_pen -= 1.8
+        if primary_tribe and "tribal_synergy" in active_plans and "token_creature_maker" in card_tags:
+            if _token_tribe_tag and _token_tribe_tag in card_tags:
+                struct_pen += 0.9
+            elif any(t.startswith("token_tribe_") for t in card_tags):
+                struct_pen -= 4.0 if explicit_tribal else 2.2
+        if "anti_flying_sweeper" in card_tags:
+            flying_bias = 0.0
+            if _tribe_tag == "tribe_bird":
+                flying_bias += 2.0
+            if "evasion" in core_tags or "evasion" in support_tags or required_tags.get("evasion", 0) > 0:
+                flying_bias += 1.0
+            if flying_bias > 0:
+                struct_pen -= 2.4 * flying_bias
 
         # (Strict tribal creature filtering is handled by hard pool exclusion
         # above — non-tribe creatures never reach composite() when enabled.)
@@ -4523,14 +4671,63 @@ def select_nonlands(
             have = selected_tag_counts.get(tag, 0)
             if have < need and tag in card_tags:
                 scale = 0.9 if tag in core_tags else 0.45
-                if tag.startswith("tribe_") and not strict_tribal:
-                    # Tribe membership alone is low-signal in multi-plan shells;
-                    # prioritize tribe cards that also move non-tribal engine tags.
-                    if card_tags & _nontribal_plan_tags:
-                        scale *= 0.95
-                    else:
-                        scale *= 0.24
+                if (
+                    _tribal_tension
+                    and _tribe_tag
+                    and tag == _tribe_tag
+                    and not strict_tribal
+                ):
+                    # Only damp tribe-only picks once the deck already has a
+                    # healthy tribe base; early picks should still establish tribe.
+                    tribe_have = selected_tag_counts.get(tag, 0)
+                    tribe_soft_gate = max(4, min(8, need // 2))
+                    if tribe_have >= tribe_soft_gate:
+                        if card_tags & _nontribal_plan_tags:
+                            scale *= 0.95
+                        else:
+                            scale *= 0.55
                 bonus += (need - have) * scale
+        if _tribe_tag and "tribal_synergy" in active_plans:
+            tribe_need = float(max(0, int(redundancy_targets.get(_tribe_tag, 0))))
+            tribe_have = _tribal_progress_score(
+                selected_tag_counts.get(_tribe_tag, 0),
+                selected_tag_counts.get(_token_tribe_tag, 0),
+            )
+            tribe_gap = max(0.0, tribe_need - tribe_have)
+            if tribe_gap > 0:
+                if _tribe_tag in card_tags:
+                    bonus += min(3.6, 1.0 + tribe_gap * 0.16)
+                elif _token_tribe_tag and _token_tribe_tag in card_tags:
+                    bonus += min(2.2, 0.65 + tribe_gap * 0.11)
+                elif is_creature(card):
+                    floor = 0.55 if explicit_tribal else 0.25
+                    scale = 0.10 if explicit_tribal else 0.06
+                    bonus -= min(3.0 if explicit_tribal else 1.8, floor + tribe_gap * scale)
+                elif "token_creature_maker" in card_tags and any(t.startswith("token_tribe_") for t in card_tags):
+                    bonus -= min(3.8 if explicit_tribal else 2.2, 0.75 + tribe_gap * (0.16 if explicit_tribal else 0.08))
+            if _token_tribe_tag and "token_creature_maker" in card_tags and any(t.startswith("token_tribe_") for t in card_tags):
+                if _token_tribe_tag in card_tags:
+                    bonus += 0.4
+                else:
+                    bonus -= 1.8 if explicit_tribal else 0.8
+        if "token_creature_maker" in card_tags:
+            token_tribes = _token_tribes_from_tags(card_tags)
+            structural_tribes = _infer_structural_tribes(
+                selected_tag_counts,
+                selected_subtype_counts,
+                plan_profile,
+            )
+            if structural_tribes:
+                if token_tribes:
+                    overlap = token_tribes & structural_tribes
+                    if overlap:
+                        bonus += 0.55 + min(0.45, 0.20 * len(overlap))
+                    else:
+                        mismatch_scale = 3.2 if (explicit_tribal or "tribal_synergy" in active_plans) else 1.1
+                        bonus -= mismatch_scale
+                elif explicit_tribal or "tribal_synergy" in active_plans:
+                    # Untyped creature tokens are usually low-value in tribal shells.
+                    bonus -= 1.1 if explicit_tribal else 0.55
         if len(selected_names) >= max(10, nonland_slots // 2):
             if any(t in card_tags for t in finisher_tags):
                 bonus += 1.5
@@ -4578,9 +4775,8 @@ def select_nonlands(
                 bonus -= min(3.0, 0.45 + unmet_nontribal * 0.12)
             tribe_have = selected_tag_counts.get(_tribe_tag, 0)
             tribe_target = max(6, int(redundancy_targets.get(_tribe_tag, 6)))
-            tribal_grace = max(4, min(8, tribe_target // 2))
-            if not contributes_nontribal_any and tribe_have >= tribal_grace:
-                over = tribe_have - tribal_grace + 1
+            if not contributes_nontribal_any and tribe_have >= tribe_target:
+                over = tribe_have - tribe_target + 1
                 bonus -= min(4.2, 0.85 + over * 0.30)
         if active_plans & {"spells_velocity", "spell_cost_engine"}:
             spells_need = max(
@@ -4611,6 +4807,16 @@ def select_nonlands(
                 bonus -= 2.8
             elif gy_shell >= 6:
                 bonus -= 1.6
+        if "anti_flying_sweeper" in card_tags:
+            if _tribe_tag == "tribe_bird":
+                bonus -= 4.8
+            flying_shell = selected_tag_counts.get("evasion", 0) + selected_tag_counts.get("tribe_bird", 0)
+            if flying_shell >= 6:
+                bonus -= min(7.0, 2.0 + (flying_shell - 6) * 0.55)
+        if "toxic_payoff" in card_tags:
+            toxic_support = selected_tag_counts.get("toxic_enabler", 0)
+            if toxic_support < 4:
+                bonus -= min(5.5, 1.8 + (4 - toxic_support) * 0.9)
         support_before, tension_before = interaction_support_tension_adjustment(
             selected_tag_counts, selected_role_counts
         )
@@ -4950,9 +5156,12 @@ def deck_fitness(
     # Orphaned payoff penalty: payoff cards with no matching enablers in the deck
     # reduces fitness — the evolutionary phase will tend to replace them
     flat_tags: Counter = Counter()
+    subtype_counts: Counter = Counter()
     for c in cards:
         for tag in tag_index.get(c["name"], frozenset()):
             flat_tags[tag] += 1
+        for subtype in get_subtypes(c):
+            subtype_counts[subtype] += 1
 
     orphan_penalty = 0.0
     for payoff_tag, enabler_tag in PAYOFF_ENABLER_PAIRS:
@@ -5018,12 +5227,14 @@ def deck_fitness(
     redundancy_targets: dict[str, int] = dict(priority_profile.get("redundancy_targets", {}))
     active_plans: frozenset[str] = frozenset(plan_profile.get("plans", frozenset()))
     primary_tribe: str | None = plan_profile.get("primary_tribe")
-    if primary_tribe and "tribal_synergy" in active_plans:
-        _tribe_tag = f"tribe_{primary_tribe}"
-        _base_target = int(redundancy_targets.get(_tribe_tag, 0))
+    explicit_tribal = bool((plan_profile or {}).get("strategy_tribal_requested"))
+    tribe_tag = f"tribe_{primary_tribe}" if primary_tribe else ""
+    token_tribe_tag = f"token_tribe_{primary_tribe}" if primary_tribe else ""
+    if primary_tribe and "tribal_synergy" in active_plans and not explicit_tribal:
+        _base_target = int(redundancy_targets.get(tribe_tag, 0))
         if _base_target > 0:
             _align = _tribal_alignment_ratio(primary_tribe, list(active_plans), cards, tag_index)
-            redundancy_targets[_tribe_tag] = _scaled_tribal_target(_base_target, _align, active_plans)
+            redundancy_targets[tribe_tag] = _scaled_tribal_target(_base_target, _align, active_plans)
     requirement_penalty = deck_requirement_penalty(
         cards,
         tag_index,
@@ -5036,8 +5247,16 @@ def deck_fitness(
     allowed_package_tags: frozenset[str] = frozenset(package_profile.get("allowed_tags", frozenset()))
     discouraged_package_tags: frozenset[str] = frozenset(package_profile.get("discouraged_tags", frozenset()))
     plan_penalty = 0.0
+    structural_tribes = _infer_structural_tribes(flat_tags, subtype_counts, plan_profile)
+    tribe_have_effective = _tribal_progress_score(
+        flat_tags.get(tribe_tag, 0),
+        flat_tags.get(token_tribe_tag, 0),
+    ) if tribe_tag else 0.0
     for tag, count in required_tags.items():
-        missing = max(0, count - flat_tags.get(tag, 0))
+        if tribe_tag and tag == tribe_tag:
+            missing = max(0.0, float(count) - tribe_have_effective)
+        else:
+            missing = max(0.0, float(count) - float(flat_tags.get(tag, 0)))
         if missing > 0:
             plan_penalty += missing * 0.45
     if not any(flat_tags.get(tag, 0) > 0 for tag in finisher_tags):
@@ -5051,7 +5270,10 @@ def deck_fitness(
     redundancy_bonus = 0.0
     redundancy_penalty = 0.0
     for tag, target in redundancy_targets.items():
-        have = flat_tags.get(tag, 0)
+        if tribe_tag and tag == tribe_tag:
+            have = tribe_have_effective
+        else:
+            have = float(flat_tags.get(tag, 0))
         if have >= target:
             redundancy_bonus += 0.22 if tag in core_tags else 0.12
         else:
@@ -5105,6 +5327,56 @@ def deck_fitness(
         gy_hate = flat_tags.get("graveyard_hate", 0)
         if gy_hate > 0:
             plan_penalty += gy_hate * 1.4
+    anti_flying = flat_tags.get("anti_flying_sweeper", 0)
+    if anti_flying > 0:
+        flying_shell = flat_tags.get("evasion", 0) + flat_tags.get("tribe_bird", 0)
+        if flying_shell >= 6:
+            plan_penalty += anti_flying * (1.8 + max(0, flying_shell - 6) * 0.22)
+    toxic_payoff = flat_tags.get("toxic_payoff", 0)
+    if toxic_payoff > 0 and flat_tags.get("toxic_enabler", 0) < 4:
+        plan_penalty += toxic_payoff * (1.4 + (4 - flat_tags.get("toxic_enabler", 0)) * 0.7)
+    if structural_tribes:
+        aligned_token_cards = 0
+        offtheme_token_cards = 0
+        untyped_token_cards = 0
+        for c in cards:
+            ctags = tag_index.get(c.get("name", ""), frozenset())
+            if "token_creature_maker" not in ctags:
+                continue
+            token_tribes = _token_tribes_from_tags(ctags)
+            if not token_tribes:
+                untyped_token_cards += 1
+                continue
+            if token_tribes & structural_tribes:
+                aligned_token_cards += 1
+            else:
+                offtheme_token_cards += 1
+        if offtheme_token_cards > 0:
+            mismatch_w = 1.05 if (explicit_tribal or "tribal_synergy" in active_plans) else 0.6
+            plan_penalty += offtheme_token_cards * mismatch_w
+            if offtheme_token_cards > aligned_token_cards:
+                plan_penalty += (offtheme_token_cards - aligned_token_cards) * (0.5 if explicit_tribal else 0.3)
+        if (explicit_tribal or "tribal_synergy" in active_plans) and untyped_token_cards > 0:
+            plan_penalty += untyped_token_cards * 0.35
+    if tribe_tag and "tribal_synergy" in active_plans:
+        offtribal_token_cards = 0
+        ontribal_token_cards = 0
+        for c in cards:
+            ctags = tag_index.get(c.get("name", ""), frozenset())
+            if "token_creature_maker" not in ctags:
+                continue
+            token_tags = {t for t in ctags if t.startswith("token_tribe_")}
+            if not token_tags:
+                continue
+            if token_tribe_tag in token_tags:
+                ontribal_token_cards += 1
+            else:
+                offtribal_token_cards += 1
+        if offtribal_token_cards > 0:
+            weight = 0.95 if explicit_tribal else 0.65
+            plan_penalty += offtribal_token_cards * weight
+            if offtribal_token_cards > ontribal_token_cards:
+                plan_penalty += (offtribal_token_cards - ontribal_token_cards) * (0.55 if explicit_tribal else 0.35)
     slot_baseline = _slot_mix_from_cards(cards)
     tag_slot_affinity = _build_tag_slot_affinity(cards, tag_index, slot_baseline)
     desired_slot_mix, _unmet_tags, unresolved_ratio = _slot_pressure_from_deficits(
@@ -5467,6 +5739,119 @@ def compute_synergy_rating(
             tribal_bonus = min(20.0, (top_tribe - 8) * 1.5)
     display = int(max(0, min(100, round(per_card * 60.0 + tribal_bonus))))
     return display, per_card
+
+
+def deck_validity_report(
+    nonlands: list[dict],
+    tag_index: dict[str, frozenset[str]],
+    commander: dict | None = None,
+    plan_profile: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """
+    Summarize deck-level validity risks (dead prerequisites, format-impossible
+    text, orphaned payoffs). Used for diagnostics and regression tracking.
+    """
+    deck_state = build_deck_state(nonlands, tag_index, classify_roles, get_subtypes, commander=commander)
+    flat_tags: Counter = Counter(deck_state["tag_counts"])
+    issue_rows: list[tuple[float, str, list[str]]] = []
+    severe_count = 0
+    hard_count = 0
+    singleton_self_named_count = 0
+    format_unavailable_count = 0
+    named_dependency_miss_count = 0
+    names_set = {c.get("name", "") for c in nonlands}
+
+    for card in nonlands:
+        name = card.get("name", "")
+        pen, unmet = evaluate_card_requirements(card, deck_state, format_name="commander")
+        missing_named = extract_named_dependencies(card) - names_set
+        if missing_named:
+            named_dependency_miss_count += len(missing_named)
+            pen += min(3.0, len(missing_named) * 1.5)
+            unmet = list(unmet) + [f"missing_named:{m}" for m in sorted(missing_named)]
+        if "singleton_self_named" in unmet:
+            singleton_self_named_count += 1
+        fmt_hits = [u for u in unmet if str(u).startswith("format_unavailable:")]
+        if fmt_hits:
+            format_unavailable_count += len(fmt_hits)
+        if unmet:
+            issue_rows.append((float(pen), name, list(unmet)))
+        if pen >= 3.0:
+            severe_count += 1
+        if pen >= 5.5 or fmt_hits:
+            hard_count += 1
+
+    orphan_payoff_count = 0
+    for payoff_tag, enabler_tag in PAYOFF_ENABLER_PAIRS:
+        n_payoff = int(flat_tags.get(payoff_tag, 0))
+        n_enabler = int(flat_tags.get(enabler_tag, 0))
+        if n_payoff > 0 and n_enabler == 0:
+            orphan_payoff_count += n_payoff
+
+    support_gap_count = 0
+    for rule in SUPPORT_VALIDATION_RULES.values():
+        payoff = sum(flat_tags.get(tag, 0) for tag in rule["payoff_tags"])
+        if payoff <= 0:
+            continue
+        support = sum(flat_tags.get(tag, 0) for tag in rule["support_tags"])
+        if support < int(rule["min_support"]):
+            support_gap_count += 1
+    for rule in NARROW_MECHANIC_RULES.values():
+        payoff = sum(flat_tags.get(tag, 0) for tag in rule["payoff_tags"])
+        if payoff <= 0:
+            continue
+        support = sum(flat_tags.get(tag, 0) for tag in rule["support_tags"])
+        if support < int(rule["min_support"]):
+            support_gap_count += 1
+
+    _rb: Counter = Counter()
+    subtype_counts: Counter = Counter()
+    for c in nonlands:
+        for r in set(classify_roles(c)):
+            _rb[r] += 1
+        for subtype in get_subtypes(c):
+            subtype_counts[subtype] += 1
+    _support_bonus, _tension_penalty = interaction_support_tension_adjustment(flat_tags, _rb)
+    _pp = plan_profile or infer_commander_plan(commander) if commander is not None else {}
+    structural_tribes = _infer_structural_tribes(flat_tags, subtype_counts, _pp)
+    token_structural_mismatch = 0
+    token_untyped_in_tribal = 0
+    if structural_tribes:
+        tribal_mode = bool(_pp and ("tribal_synergy" in frozenset(_pp.get("plans", frozenset()))))
+        for c in nonlands:
+            ctags = tag_index.get(c.get("name", ""), frozenset())
+            if "token_creature_maker" not in ctags:
+                continue
+            token_tribes = _token_tribes_from_tags(ctags)
+            if not token_tribes:
+                if tribal_mode:
+                    token_untyped_in_tribal += 1
+                continue
+            if not (token_tribes & structural_tribes):
+                token_structural_mismatch += 1
+
+    issue_rows.sort(key=lambda x: x[0], reverse=True)
+    top_issues = [
+        {"name": name, "penalty": round(pen, 2), "unmet": unmet[:5]}
+        for pen, name, unmet in issue_rows[:10]
+    ]
+    avg_requirement_penalty = (
+        sum(p for p, _name, _unmet in issue_rows) / max(1, len(nonlands))
+    )
+    return {
+        "avg_requirement_penalty": round(avg_requirement_penalty, 3),
+        "severe_cards": severe_count,
+        "hard_fail_cards": hard_count,
+        "singleton_self_named": singleton_self_named_count,
+        "format_unavailable": format_unavailable_count,
+        "missing_named_dependencies": named_dependency_miss_count,
+        "orphan_payoff_count": orphan_payoff_count,
+        "support_gap_count": support_gap_count,
+        "token_structural_mismatch": token_structural_mismatch,
+        "token_untyped_in_tribal": token_untyped_in_tribal,
+        "tension_penalty": round(float(_tension_penalty), 3),
+        "top_issues": top_issues,
+    }
 
 
 def generate_commander_candidates(
@@ -5944,6 +6329,34 @@ def print_analysis(nonlands: list[dict], lands: list[dict], archetype: str,
             status = "ok" if support >= need else "missing"
             print(f"  {name.replace('_', ' ').title():<28s}: {support}/{need} ({status}, payoffs {payoff})", file=sys.stderr)
 
+    validity = deck_validity_report(nonlands, tag_index, commander=None, plan_profile=plan_profile)
+    print("\nValidity Checks:", file=sys.stderr)
+    print(
+        f"  Severe / Hard Cards          : "
+        f"{validity['severe_cards']} / {validity['hard_fail_cards']}",
+        file=sys.stderr,
+    )
+    print(
+        f"  Orphan Payoffs / Support Gaps: "
+        f"{validity['orphan_payoff_count']} / {validity['support_gap_count']}",
+        file=sys.stderr,
+    )
+    print(
+        f"  Singleton Self-Named         : {validity['singleton_self_named']}",
+        file=sys.stderr,
+    )
+    if validity["format_unavailable"] > 0 or validity["missing_named_dependencies"] > 0:
+        print(
+            f"  Format-unavailable / Missing Named: "
+            f"{validity['format_unavailable']} / {validity['missing_named_dependencies']}",
+            file=sys.stderr,
+        )
+    if validity["top_issues"]:
+        print("  Top Issues:", file=sys.stderr)
+        for row in validity["top_issues"][:5]:
+            why = ", ".join(row["unmet"][:3]) if row["unmet"] else "unspecified"
+            print(f"    - {row['name']}: {why}", file=sys.stderr)
+
     if plan_profile:
         required_tags: dict[str, int] = dict(plan_profile.get("required_tags", {}))
         package_profile = choose_active_packages(plan_profile, nonlands, tag_index)
@@ -6384,6 +6797,7 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
     synergy_score, synergy_per_card = compute_synergy_rating(
         selected_nonlands, db, tag_index, plan_profile=plan_profile
     )
+    validity = deck_validity_report(selected_nonlands, tag_index, commander=commander, plan_profile=plan_profile)
 
     return {
         "mode": "commander",
@@ -6401,6 +6815,7 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
         "tribes": [[t, c] for t, c in tribe_counter.most_common(8) if c >= 3],
         "synergy_score": synergy_score,
         "synergy_per_card": synergy_per_card,
+        "validity": validity,
         "avg_cmc": sum(get_cmc(c) for c in selected_nonlands) / max(len(selected_nonlands), 1),
         "avg_power": sum(score_power(c) for c in selected_nonlands) / max(len(selected_nonlands), 1),
         "deck_text": format_commander(commander, selected_nonlands, selected_lands),

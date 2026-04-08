@@ -59,10 +59,15 @@ def _type_words(card: dict) -> set[str]:
 def infer_card_requirements(card: dict) -> tuple[dict[str, object], ...]:
     oracle = (card.get("oracle_text") or "").lower()
     keywords = {k.lower() for k in (card.get("keywords") or [])}
+    card_name = (card.get("name") or "").lower()
     reqs: list[dict[str, object]] = []
 
     if "learn" in oracle or "learn" in keywords:
         reqs.append({"kind": "mechanic_disabled", "mechanic": "learn", "penalty": 5.5})
+    if re.search(r"outside the game|from outside the game|your sideboard", oracle):
+        reqs.append({"kind": "format_unavailable", "feature": "outside_game", "penalty": 6.5})
+    if re.search(r"\bante\b", oracle):
+        reqs.append({"kind": "format_unavailable", "feature": "ante", "penalty": 8.0})
 
     if re.search(r"\bmulticolored creature\b", oracle):
         reqs.append({"kind": "multicolor_creature_count", "min": 6, "penalty": 3.8})
@@ -76,7 +81,10 @@ def infer_card_requirements(card: dict) -> tuple[dict[str, object], ...]:
     subtype_patterns = [
         (r"reveal (?:a|an) ([a-z]+) card", 7, 3.8),
         (r"if you control (?:a|an|another) ([a-z]+)", 6, 3.0),
+        (r"whenever (?:another |an? )?([a-z]+) you control enters(?: the battlefield)?", 6, 3.2),
+        (r"other ([a-z]+) creatures? you control", 6, 3.2),
         (r"for each ([a-z]+) you control", 6, 2.6),
+        (r"number of ([a-z]+) you control", 6, 2.8),
         (r"sacrifice (?:a|an) ([a-z]+)", 5, 2.6),
     ]
     for pattern, minimum, penalty in subtype_patterns:
@@ -86,6 +94,31 @@ def infer_card_requirements(card: dict) -> tuple[dict[str, object], ...]:
                 reqs.append({"kind": "type_count", "types": (token,), "min": minimum, "penalty": penalty})
             elif token in CREATURE_TYPES:
                 reqs.append({"kind": "subtype_count", "subtypes": (token.title(),), "min": minimum, "penalty": penalty})
+
+    # Keyword-gated tribal-adjacent engines (Arcades/Flensing style).
+    keyword_shell_rules = [
+        ("defender", 5, 5.2),
+        ("toxic", 4, 5.0),
+    ]
+    for kw, minimum, penalty in keyword_shell_rules:
+        if re.search(rf"\b(?:creatures?|permanents?) you control with {kw}\b|with {kw} enters", oracle):
+            reqs.append({"kind": "keyword_count", "keyword": kw, "min": minimum, "penalty": penalty})
+
+    # Generic keyword-gated shells: "creatures you control with flying/ward/etc."
+    for kw in ("flying", "artifact", "enchantment", "legendary"):
+        if re.search(rf"\b(?:creatures?|permanents?) you control with {kw}\b", oracle):
+            if kw in {"artifact", "enchantment", "legendary"}:
+                reqs.append({"kind": "type_count", "types": (kw,), "min": 5, "penalty": 2.8})
+            else:
+                reqs.append({"kind": "keyword_count", "keyword": kw, "min": 6, "penalty": 2.8})
+
+    # Singleton dead pattern: a card searching for additional copies of itself.
+    # Example: "search ... for cards named Squadron Hawk" in Commander singleton.
+    for m in re.finditer(r"cards? named ([^.,;\n]+)", oracle):
+        target = m.group(1).strip().lower()
+        if card_name and card_name in target:
+            reqs.append({"kind": "singleton_self_named", "penalty": 5.5})
+            break
 
     if re.search(r"legendary creature cards? you own|your commander|commander creatures? you own", oracle):
         reqs.append({"kind": "commander_text", "penalty": 3.5})
@@ -173,9 +206,21 @@ def evaluate_card_requirements(
             if have < need:
                 penalty += req_penalty * (need - have) / need
                 unmet.append(f"tag<{need}:{','.join(req['tags'])}")
+        elif kind == "keyword_count":
+            have = int(deck_state["keyword_counts"].get(str(req["keyword"]).lower(), 0))
+            need = int(req["min"])
+            if have < need:
+                penalty += req_penalty * (need - have) / need
+                unmet.append(f"keyword<{need}:{req['keyword']}")
         elif kind == "commander_text":
             penalty += req_penalty
             unmet.append("commander_only_text")
+        elif kind == "format_unavailable":
+            penalty += req_penalty
+            unmet.append(f"format_unavailable:{req.get('feature', 'unknown')}")
+        elif kind == "singleton_self_named":
+            penalty += req_penalty
+            unmet.append("singleton_self_named")
     return penalty, unmet
 
 
