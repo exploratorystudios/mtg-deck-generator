@@ -225,6 +225,33 @@ ARCHETYPE_CONFIG = {
     },
 }
 
+# Role clusters used to turn archetype fit into a deck-aware signal.
+# Cards should score better when they reinforce the role pattern the deck is
+# already converging toward, not just when they are generically legal for the
+# archetype in isolation.
+ARCHETYPE_ROLE_CLUSTERS: dict[str, tuple[tuple[str, frozenset[str]], ...]] = {
+    "aggro": (
+        ("pressure", frozenset({"threat", "wincon"})),
+        ("tempo", frozenset({"removal", "disruption"})),
+        ("velocity", frozenset({"draw", "ramp"})),
+    ),
+    "midrange": (
+        ("value", frozenset({"threat", "draw", "utility", "wincon"})),
+        ("interaction", frozenset({"removal", "disruption"})),
+        ("mana", frozenset({"ramp", "tutor"})),
+    ),
+    "control": (
+        ("interaction", frozenset({"counterspell", "removal", "sweeper", "disruption"})),
+        ("advantage", frozenset({"draw", "tutor", "utility"})),
+        ("finishers", frozenset({"threat", "wincon"})),
+    ),
+    "combo": (
+        ("engine", frozenset({"draw", "tutor", "ramp", "utility"})),
+        ("protection", frozenset({"counterspell", "disruption", "removal"})),
+        ("payload", frozenset({"wincon", "threat"})),
+    ),
+}
+
 # Karsten source requirements: {pip_count: {turn: sources_needed}}
 # Scaled for a 24-land deck at ~90% consistency threshold.
 # Source: Frank Karsten, ChannelFireball / TCGPlayer 2022 update.
@@ -310,6 +337,22 @@ def card_matches_strategy(card: dict, matchers: list[tuple]) -> bool:
     return False
 
 
+# ── Change 2: Format-legality filter constants ──────────────────────────────
+ILLEGAL_LAYOUTS: frozenset[str] = frozenset({
+    "sticker", "token", "emblem", "art_series", "double_faced_token",
+    "scheme", "plane", "phenomenon", "vanguard",
+})
+ILLEGAL_TYPE_TOKENS: frozenset[str] = frozenset({
+    "Sticker", "Token", "Emblem",
+})
+_ILLEGAL_ORACLE_RE = re.compile(
+    r"\b(un-?set|silver-?border(?:ed)?|acorn stamp)\b", re.I
+)
+SILVER_BORDER_SETS: frozenset[str] = frozenset({
+    "UGL", "UNH", "UND", "UST", "UNF",
+})
+
+
 def load_card_database() -> dict[str, dict]:
     """Load card database from bundle JSON (fast) or individual files (fallback)."""
     # Prefer pre-built bundle: data/cards_commander.json (already processed, ~18 MB)
@@ -342,9 +385,13 @@ def load_card_database() -> dict[str, dict]:
             front = card["card_faces"][0]
             card = {**card, **{k: v for k, v in front.items() if k not in card or not card[k]}}
 
-        # Exclude Un-set sticker cards — they have no playable game text
-        if (card.get("layout") == "sticker"
-                or "Sticker" in (card.get("type_line") or "")):
+        # Change 2: broad format-legality filter
+        if card.get("layout") in ILLEGAL_LAYOUTS:
+            continue
+        type_line_raw = card.get("type_line") or ""
+        if any(tok in type_line_raw for tok in ILLEGAL_TYPE_TOKENS):
+            continue
+        if card.get("set", "").upper() in SILVER_BORDER_SETS:
             continue
 
         name = card.get("name", "").strip()
@@ -1693,6 +1740,104 @@ def detect_synergy_tags(card: dict) -> frozenset[str]:
         tags.add("ninjutsu_enabler")
 
     return frozenset(tags)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 5: Constructed-playability heuristic
+# ─────────────────────────────────────────────────────────────────────────────
+
+def score_constructed_playability(card: dict) -> float:
+    """
+    Return a heuristic playability bonus in [-2.0, +2.0] based on card
+    design patterns that are broadly good in Commander without needing
+    external win-rate data.
+
+    Positive signals  → flexible, efficient, high-upside cards
+    Negative signals  → narrow, parasitic, or symmetrical-disadvantage cards
+    """
+    oracle = (card.get("oracle_text") or "").lower()
+    keywords = {k.lower() for k in (card.get("keywords") or [])}
+    cmc = card.get("cmc") or 0
+    type_line = (card.get("type_line") or "")
+    is_creat = "Creature" in type_line
+
+    score = 0.0
+
+    # --- Positive: efficient card advantage ---
+    if re.search(r"\bdraw (?:two|three|\d+) cards?\b", oracle):
+        score += 0.6
+    elif re.search(r"\bdraw a card\b", oracle):
+        score += 0.3
+    if re.search(r"\bsearch your library\b", oracle):
+        score += 0.5
+    if re.search(r"\breturn .{0,30} from your graveyard\b", oracle):
+        score += 0.3
+
+    # --- Positive: removal / disruption ---
+    if re.search(r"\bdestroy target\b|\bexile target\b", oracle):
+        score += 0.4
+    if re.search(r"\bcounter target spell\b", oracle):
+        score += 0.4
+
+    # --- Positive: evasion on creatures ---
+    if is_creat and any(k in keywords for k in ("flying", "trample", "menace", "deathtouch", "lifelink")):
+        score += 0.25
+    if is_creat and re.search(r"can't be blocked", oracle):
+        score += 0.3
+
+    # --- Positive: flexibility (modal / kick / X spells) ---
+    if re.search(r"\bkicker\b|\bescalate\b|\bchoose one —|\bchoose two —|\bchoose up to\b", oracle):
+        score += 0.35
+    if cmc == 0 and re.search(r"\{x\}", (card.get("mana_cost") or "").lower()):
+        score += 0.2  # X-cost spells (Cyclonic Rift style already has cmc > 0)
+
+    # --- Positive: ETB value (already rewarded by tags; mild bonus here) ---
+    if is_creat and re.search(r"when .{0,20} enters", oracle):
+        score += 0.15
+
+    # --- Negative: parasitic / build-around-only ---
+    if re.search(r"\bfate counter\b|\bstory circle\b|\bpayoff only if\b", oracle):
+        score -= 0.5
+    # Un-set / acorn stamp already filtered; this catches edge cases
+    if re.search(r"\bacorn\b", oracle) and "acorn" not in (card.get("name") or "").lower():
+        score -= 1.0
+
+    # --- Negative: heavy symmetry that helps opponents ---
+    if re.search(r"each player draws\b|each player searches\b", oracle):
+        score -= 0.5
+    if re.search(r"each player (creates?|gets?|gains?).{0,20}token", oracle):
+        score -= 0.3
+
+    # --- Negative: high cmc with no immediate impact marker ---
+    if cmc >= 7 and not re.search(
+        r"\bdraw\b|\bsearch\b|\bdestroy\b|\bexile\b|\bcounter\b|\buntap\b", oracle
+    ):
+        score -= 0.4
+
+    return max(-2.0, min(2.0, score))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 1: Named-card dependency extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Matches patterns like: "named Voltaic Key", "a card named Sol Ring"
+# Captures the card name that follows "named".
+_NAMED_CARD_RE = re.compile(
+    r'\bnamed\s+"?([A-Z][A-Za-z\' ,\-]+?)"?'
+    r'(?=\s*[,.\)]|\s+(?:is|are|that|which|you|in|on|to|from|with|when|if)\b)',
+)
+
+
+def extract_named_dependencies(card: dict) -> frozenset[str]:
+    """
+    Return a frozenset of card names that this card explicitly names in its
+    oracle text (e.g. "named Sol Ring", "named Voltaic Key").
+    These cards are treated as soft dependencies: if the dependency is absent
+    from the deck, the card incurs a scoring penalty.
+    """
+    oracle = card.get("oracle_text") or ""
+    return frozenset(m.group(1).strip() for m in _NAMED_CARD_RE.finditer(oracle))
 
 
 # Synergy pair relationships: (source_tag, target_tag) — having both in a deck is good
@@ -3070,14 +3215,24 @@ def score_power(card: dict) -> float:
     if cmc >= 8:
         score -= 2.0
 
-    # Anti-synergy: card gives the opponent resources
+    # Change 4: stronger opponent-helps penalties
     if re.search(r"target opponent (creates?|puts?|draws?|gains?)", oracle):
-        score -= 2.0
+        score -= 3.5
     if re.search(r"each opponent (creates?|draws?|gains? \d+ life)", oracle):
-        score -= 1.0
+        score -= 2.5
+    if re.search(r"\beach opponent(?:s)? draws\b", oracle):
+        score -= 3.0
+    if re.search(r"(opponent|opponents) (?:may |also )?(?:draw|search|tutor)", oracle):
+        score -= 2.5
+    if re.search(r"(you and|both) (?:your )?opponents?", oracle):
+        score -= 1.5
 
     # Treat unknown rarities (e.g. "special") as "rare"
     score += RARITY_BONUS.get(rarity, RARITY_BONUS["rare"])
+
+    # Change 5: blend in constructed-playability heuristic
+    score += score_constructed_playability(card) * 0.5
+
     return max(0.0, min(10.0, score))
 
 
@@ -3155,6 +3310,66 @@ def score_archetype_fit(card: dict, archetype: str, roles: list[str]) -> float:
     return max(0.0, min(1.0, cmc_fit * 0.35 + role_fit * 0.45 + bonus * 0.20))
 
 
+def archetype_blend_multiplier(
+    roles: list[str],
+    archetype: str,
+    role_counts: Counter,
+    selection_size: int,
+    nonland_slots: int,
+) -> float:
+    """
+    Scale archetype fit based on the current deck shape.
+
+    Early picks stay neutral. Once a shell exists, cards that reinforce the
+    deck's dominant role cluster get rewarded, while cards that pull toward a
+    weakly represented cluster get a mild penalty unless they help close an
+    archetype-role deficit.
+    """
+    if selection_size < 8 or not roles:
+        return 1.0
+
+    clusters = ARCHETYPE_ROLE_CLUSTERS.get(archetype, ())
+    if not clusters:
+        return 1.0
+
+    cluster_scores = {
+        name: sum(int(role_counts.get(role, 0)) for role in cluster_roles)
+        for name, cluster_roles in clusters
+    }
+    dominant_score = max(cluster_scores.values(), default=0)
+    if dominant_score <= 0:
+        return 1.0
+
+    matching_scores = [
+        cluster_scores[name]
+        for name, cluster_roles in clusters
+        if set(roles) & cluster_roles
+    ]
+    if not matching_scores:
+        return 1.0
+
+    card_cluster_score = max(matching_scores)
+    avg_cluster_score = sum(cluster_scores.values()) / max(len(cluster_scores), 1)
+    fill_ratio = min(1.0, selection_size / max(nonland_slots, 1))
+    coherence = (card_cluster_score - avg_cluster_score) / max(dominant_score, 1)
+    multiplier = 1.0 + coherence * (0.14 + 0.10 * fill_ratio)
+
+    role_targets = {
+        role: max(1, round(nonland_slots * ratio))
+        for role, ratio in ARCHETYPE_CONFIG[archetype]["role_ratios"].items()
+    }
+    deficit_relief = max(
+        (
+            role_targets.get(role, 0) - int(role_counts.get(role, 0))
+        ) / max(role_targets.get(role, 1), 1)
+        for role in roles
+    )
+    if deficit_relief > 0:
+        multiplier += min(0.10, deficit_relief * 0.10)
+
+    return max(0.88, min(1.22, multiplier))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ARCHETYPE STRUCTURE VALIDATION
 # Hard deck-level expectations used by selection and evolutionary refinement.
@@ -3162,6 +3377,22 @@ def score_archetype_fit(card: dict, archetype: str, roles: list[str]) -> float:
 # but they should not be accepted if they miss the basic structural skeleton
 # of their archetype.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Change 6: Infrastructure slot reservations ──────────────────────────────
+# Phase -1 guarantees these cards are always attempted before Phase 0.
+# Each entry: (role_or_tag, n_slots, cmc_max, filter_fn_name_or_None)
+# role_or_tag : matched against classify_roles(card) or tag_index[card]
+# n_slots     : maximum number of cards to pull in Phase -1
+# cmc_max     : only cards with cmc <= this value qualify (None = no cap)
+INFRASTRUCTURE_SLOTS: list[tuple[str, int, int | None]] = [
+    ("ramp",        8,  4),   # mana ramp, keep curves low
+    ("draw",        6,  5),   # card draw
+    ("removal",     5,  4),   # targeted removal
+    ("sweeper",     2,  6),   # board wipes
+    ("counterspell",3,  3),   # counterspells
+    ("tutor",       2,  5),   # tutors
+]
+
 
 ARCHETYPE_HARD_RULES: dict[str, dict[str, object]] = {
     "aggro": {
@@ -3467,8 +3698,15 @@ def select_nonlands(
         if re.search(r"if you.ve drawn (seven|eight|nine|ten|\d+) or more cards", card_oracle):
             struct_pen -= 2.5  # The Modern Age
 
-        # Orphaned payoff: payoff tag present but no enablers exist in the pool
+        # Change 1: penalise cards whose named dependencies are absent from pool
         card_tags = tag_index.get(card.get("name", ""), frozenset())
+        _named_deps = extract_named_dependencies(card)
+        if _named_deps:
+            _missing_deps = _named_deps - _pool_names
+            # Each missing named dependency subtracts up to 1.5 (capped at 3.0 total)
+            struct_pen -= min(3.0, len(_missing_deps) * 1.5)
+
+        # Orphaned payoff: payoff tag present but no enablers exist in the pool
         for payoff_tag, enabler_tag in PAYOFF_ENABLER_PAIRS:
             if payoff_tag in card_tags and enabler_tag not in _pool_tags:
                 struct_pen -= 2.5
@@ -3511,6 +3749,14 @@ def select_nonlands(
                 if _partners.issubset(_pool_names):
                     _w = 3.5 if _cmb["type"] == "instant_win" else 2.5
                     struct_pen += _w
+
+        # Change 3: quality gate — low-power cards get diminished strategy bonus
+        # so a keyword match on a bad card can't drag it into the deck.
+        # pw is on [0, 10]; gate kicks in below 3.0 (clearly weak cards).
+        if pw < 3.0:
+            sb *= pw / 3.0
+        elif pw < 5.0:
+            sb *= 0.7 + 0.3 * ((pw - 3.0) / 2.0)
 
         base = pw * 0.30 + af * 10 * 0.35 + sb + struct_pen
         if diversity > 0:
@@ -3608,6 +3854,7 @@ def select_nonlands(
         card_tags = tag_index.get(card_name, frozenset())
         bonus = 0.0
         card = db[card_name]
+        card_roles = classify_roles(card)
         current_deck_state = {
             "subtype_counts": selected_subtype_counts,
             "type_counts": selected_type_counts,
@@ -3621,6 +3868,18 @@ def select_nonlands(
         )
         bonus -= req_penalty * 0.85
         bonus -= commander_role_penalty(card)
+        archetype_fit = score_archetype_fit(card, archetype, card_roles)
+        archetype_blend = archetype_blend_multiplier(
+            card_roles,
+            archetype,
+            selected_role_counts,
+            len(selected_names),
+            nonland_slots,
+        )
+        # Mirror the selection-time archetype contribution (af * 10 * 0.35)
+        # so cards that reinforce the current archetype shell get pulled upward
+        # and archetype-legal but incoherent cards lose some of their edge.
+        bonus += archetype_fit * 3.5 * (archetype_blend - 1.0)
         for tag, need in required_tags.items():
             have = selected_tag_counts.get(tag, 0)
             if have < need and tag in card_tags:
@@ -3712,6 +3971,29 @@ def select_nonlands(
             overflow = current_avg_cmc - float(max_avg_cmc)
             bonus -= overflow * 2.8
         return bonus
+
+    # ── Phase -1: Infrastructure reservation ──────────────────────────────────
+    # Lock in a minimum of foundational utility cards before strategy-driven
+    # phases can fill all remaining slots with synergy or curve cards.
+    # Each infrastructure role gets a slot budget; we pick the top-scored card
+    # for each role until the budget is exhausted or slots run out.
+    _infra_role_have: Counter = Counter()
+    for _infra_role, _infra_n, _infra_cmc_max in INFRASTRUCTURE_SLOTS:
+        for _sc, _card in global_scored:
+            if _infra_role_have[_infra_role] >= _infra_n:
+                break
+            if len(selected_names) >= nonland_slots:
+                break
+            _cn = _card.get("name", "")
+            if _cn in copy_counts or _cn == commander_name:
+                continue
+            if _infra_cmc_max is not None and get_cmc(_card) > _infra_cmc_max:
+                continue
+            _card_roles = classify_roles(_card)
+            _card_tags = tag_index.get(_cn, frozenset())
+            if _infra_role in _card_roles or _infra_role in _card_tags:
+                _add_selected_card(_cn, 1)
+                _infra_role_have[_infra_role] += 1
 
     # ── Phase 0: Mandatory density pre-fill ───────────────────────────────────
     # For each primary plan component, guarantee a floor of cards before the
@@ -3941,6 +4223,14 @@ def deck_fitness(
             # Scale penalty: 0.4 per orphaned payoff card, min penalty of 1.0
             orphan_penalty += max(1.0, n_payoff * 0.4)
 
+    # Change 1: named-card dependency penalty — cards that name absent cards
+    _deck_name_set: frozenset[str] = frozenset(c.get("name", "") for c in cards)
+    named_dep_penalty = 0.0
+    for card in cards:
+        missing = extract_named_dependencies(card) - _deck_name_set
+        named_dep_penalty += min(3.0, len(missing) * 1.5)
+    named_dep_penalty /= max(len(cards), 1)
+
     narrow_adjustment = _narrow_mechanic_adjustment(flat_tags)
     support_adjustment = _support_rule_adjustment(flat_tags)
     liability_cost = sum(liability_penalty(c) for c in cards) / max(len(cards), 1)
@@ -4074,6 +4364,7 @@ def deck_fitness(
             + engine_flow_score
             + win_con_score
             - orphan_penalty
+            - named_dep_penalty
             - liability_cost
             - requirement_penalty
             - redundancy_penalty
@@ -4093,6 +4384,7 @@ def deck_fitness(
         + engine_flow_score
         + win_con_score
         - orphan_penalty
+        - named_dep_penalty
         - liability_cost
         - requirement_penalty
         - redundancy_penalty
@@ -4465,10 +4757,12 @@ def build_mana_base(
     land_pool: list[dict],
     colors: set[str],
     land_count: int,
+    plan_tags: frozenset[str] | None = None,
 ) -> list[dict]:
     """
     Select lands to form a Karsten-sound mana base.
     Returns a list of land card dicts (with repetition for multiple copies).
+    plan_tags: frozenset of plan-relevant tags used to boost contextually useful lands.
     """
     if not colors:
         return []
@@ -4519,13 +4813,45 @@ def build_mana_base(
     #   2. More of our needed colors first (2-color dual > single basic)
     #   3. Fewer extra colors (Blood Crypt exact B/R > 5-color Mana Confluence)
     # This ensures specialized duals (shock, fast, check) beat broad 5-color sources.
+    # Change 7: plan-aware land priority
+    _plan_tags = plan_tags or frozenset()
+    # Utility oracle patterns rewarded by specific plan tags
+    _LAND_UTILITY_PATTERNS: list[tuple[frozenset[str], re.Pattern]] = [
+        (frozenset({"draw", "draw_count_payoff"}), re.compile(r"\bdraw a card\b", re.I)),
+        (frozenset({"graveyard_payoff", "graveyard_enabler", "self_mill"}),
+         re.compile(r"\bmill\b|\bgraveyard\b", re.I)),
+        (frozenset({"artifact_payoff", "artifact"}),
+         re.compile(r"\bartifact\b", re.I)),
+        (frozenset({"token_maker", "token_payoff"}),
+         re.compile(r"\bcreate.{0,20}token\b", re.I)),
+        (frozenset({"lifegain", "life_as_resource"}),
+         re.compile(r"\bgain \d+ life\b|\bgain life\b", re.I)),
+    ]
+
+    def _land_utility_bonus(land: dict) -> float:
+        """Return a small positive bonus if the land has oracle utility matching the plan."""
+        if not _plan_tags:
+            return 0.0
+        oracle = (land.get("oracle_text") or "").lower()
+        bonus = 0.0
+        for tag_set, pattern in _LAND_UTILITY_PATTERNS:
+            if tag_set & _plan_tags and pattern.search(oracle):
+                bonus += 0.5
+        return bonus
+
+    # Cap: no more than 1/5 of the land slots may be tapped-only generic utility
+    _generic_utility_cap = max(3, land_count // 5)
+    _generic_utility_count = 0
+
     def land_priority(land: dict) -> tuple:
         prod = land_produces(land)
         in_colors = prod & colors           # colors we actually want
         extra = prod - colors               # colors we don't need
         reliable = is_reliable_untapped(land)
+        utility = _land_utility_bonus(land)
         # Tiebreak alphabetically for determinism across runs
-        return (not reliable, -len(in_colors), len(extra), land.get("name", ""))
+        # Lower tuple = higher priority (sort ascending)
+        return (not reliable, -len(in_colors), len(extra), -utility, land.get("name", ""))
 
     sorted_lands = sorted(land_pool, key=land_priority)
 
@@ -4544,6 +4870,11 @@ def build_mana_base(
         # Brawl singleton: basics can stack, every non-basic is limited to 1
         max_copies = 20 if is_basic else 1
 
+        # Change 7: cap tapped-only non-basic utility lands
+        _is_tapped_nonbasic = (not is_basic) and (not is_reliable_untapped(land))
+        if _is_tapped_nonbasic and _generic_utility_count >= _generic_utility_cap:
+            continue
+
         copies_added = 0
         for _ in range(max_copies):
             # Stop if all needs satisfied or we've run out of slots
@@ -4557,6 +4888,8 @@ def build_mana_base(
                 if remaining.get(c, 0) > 0:
                     remaining[c] -= 1
             copies_added += 1
+        if _is_tapped_nonbasic and copies_added > 0:
+            _generic_utility_count += copies_added
 
     # ── Step 4: Backfill with basics if still short ──────────────────────────
     # Identify one basic land per color
@@ -4951,7 +5284,8 @@ def main() -> None:
 
     # ── Build mana base ──────────────────────────────────────────────────────
     print("Building mana base...", file=sys.stderr)
-    selected_lands = build_mana_base(selected_nonlands, usable_lands, colors, land_count)
+    _plan_tags_for_mana = frozenset(plan_profile.get("required_tags", {}).keys()) if plan_profile else frozenset()
+    selected_lands = build_mana_base(selected_nonlands, usable_lands, colors, land_count, plan_tags=_plan_tags_for_mana)
 
     # ── Analysis ─────────────────────────────────────────────────────────────
     print_analysis(selected_nonlands, selected_lands, archetype, db, tag_index, plan_profile=plan_profile)
@@ -5120,7 +5454,8 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
         )
 
     _p("Building mana base…", 85)
-    selected_lands = build_mana_base(selected_nonlands, usable_lands, colors, land_count)
+    _plan_tags_for_mana = frozenset(plan_profile.get("required_tags", {}).keys()) if plan_profile else frozenset()
+    selected_lands = build_mana_base(selected_nonlands, usable_lands, colors, land_count, plan_tags=_plan_tags_for_mana)
 
     _p("Assembling result…", 95)
 
