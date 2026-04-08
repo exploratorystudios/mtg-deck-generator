@@ -315,6 +315,17 @@ QToolTip {
 # HELPER WIDGETS
 # ══════════════════════════════════════════════════════════════════════════════
 
+class _WheelIgnore(QObject):
+    """Event filter that swallows wheel events so scroll can't change widget values."""
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel:
+            event.ignore()
+            return True
+        return super().eventFilter(obj, event)
+
+_wheel_filter = _WheelIgnore()
+
+
 class Divider(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3388,6 +3399,7 @@ class LeftPanel(QWidget):
         self._commanders_loaded = False
         self._cmd_loader: object | None = None
         self._cmd_combo.currentIndexChanged.connect(self._on_commander_changed)
+        self._cmd_combo.installEventFilter(_wheel_filter)
         form.addWidget(self._cmd_section)
 
         form.addWidget(Divider())
@@ -3397,6 +3409,7 @@ class LeftPanel(QWidget):
         self.archetype_combo = QComboBox()
         for arch in ("aggro", "midrange", "control", "combo"):
             self.archetype_combo.addItem(arch.capitalize(), arch)
+        self.archetype_combo.installEventFilter(_wheel_filter)
         form.addWidget(self.archetype_combo)
 
         self.archetype_desc = QLabel(ARCHETYPE_DESCS["aggro"])
@@ -3414,6 +3427,30 @@ class LeftPanel(QWidget):
 
         form.addWidget(Divider())
 
+        # ── Strict Tribal ─────────────────────────────────────────────────
+        form.addWidget(SectionLabel("Strict Tribal"))
+        tribal_row = QWidget()
+        tribal_l = QHBoxLayout(tribal_row)
+        tribal_l.setContentsMargins(0, 0, 0, 0)
+        tribal_l.setSpacing(8)
+        self.strict_tribal_check = QCheckBox("Enforce creature type:")
+        self.strict_tribal_check.setStyleSheet("color: #e6edf3; font-size: 12px;")
+        self.strict_tribal_check.setToolTip(
+            "Non-tribe creatures are heavily penalized during deck building.\n"
+            "Support cards (ramp, draw, removal) are unaffected."
+        )
+        self.strict_tribal_edit = QLineEdit()
+        self.strict_tribal_edit.setPlaceholderText("e.g. Goblin")
+        self.strict_tribal_edit.setFixedWidth(100)
+        self.strict_tribal_edit.setEnabled(False)
+        self.strict_tribal_check.toggled.connect(self.strict_tribal_edit.setEnabled)
+        tribal_l.addWidget(self.strict_tribal_check)
+        tribal_l.addWidget(self.strict_tribal_edit)
+        tribal_l.addStretch()
+        form.addWidget(tribal_row)
+
+        form.addWidget(Divider())
+
         # ── Rarity ────────────────────────────────────────────────────────
         form.addWidget(SectionLabel("Max Rarity"))
         self.rarity_combo = QComboBox()
@@ -3425,6 +3462,7 @@ class LeftPanel(QWidget):
                 RARITY_COLORS[r],
                 Qt.ForegroundRole
             )
+        self.rarity_combo.installEventFilter(_wheel_filter)
         form.addWidget(self.rarity_combo)
 
         form.addWidget(Divider())
@@ -3477,6 +3515,7 @@ class LeftPanel(QWidget):
         self.seed_spin.setRange(0, 999999)
         self.seed_spin.setValue(42)
         self.seed_spin.setEnabled(False)
+        self.seed_spin.installEventFilter(_wheel_filter)
         self.seed_check.toggled.connect(self.seed_spin.setEnabled)
         seed_l.addWidget(self.seed_check)
         seed_l.addWidget(self.seed_spin)
@@ -3493,6 +3532,7 @@ class LeftPanel(QWidget):
         self.gen_spin.setRange(0, 2000)
         self.gen_spin.setValue(400)
         self.gen_spin.setSingleStep(50)
+        self.gen_spin.installEventFilter(_wheel_filter)
         gen_l.addWidget(gen_label)
         gen_l.addWidget(self.gen_spin)
         gen_slider = QSlider(Qt.Horizontal)
@@ -3514,6 +3554,7 @@ class LeftPanel(QWidget):
         """)
         gen_slider.valueChanged.connect(self.gen_spin.setValue)
         self.gen_spin.valueChanged.connect(gen_slider.setValue)
+        gen_slider.installEventFilter(_wheel_filter)
         adv_layout.addWidget(gen_row)
         adv_layout.addWidget(gen_slider)
 
@@ -3530,6 +3571,7 @@ class LeftPanel(QWidget):
         self.div_spin.setValue(1.0)
         self.div_spin.setDecimals(1)
         self.div_spin.setFixedWidth(60)
+        self.div_spin.installEventFilter(_wheel_filter)
         self.div_spin.setToolTip(
             "0.0 = fully deterministic (same seed → same deck)\n"
             "1.0 = balanced variety (default)\n"
@@ -3553,6 +3595,7 @@ class LeftPanel(QWidget):
         self.candidate_spin = QSpinBox()
         self.candidate_spin.setRange(1, 20)
         self.candidate_spin.setValue(6)
+        self.candidate_spin.installEventFilter(_wheel_filter)
         self.candidate_spin.setToolTip(
             "How many different deck shapes to explore before choosing the best one.\n"
             "Higher values improve search breadth but take longer."
@@ -3584,6 +3627,7 @@ class LeftPanel(QWidget):
         self.land_spin.setRange(17, 30)
         self.land_spin.setValue(24)
         self.land_spin.setEnabled(False)
+        self.land_spin.installEventFilter(_wheel_filter)
         self.land_check.toggled.connect(self.land_spin.setEnabled)
         land_l.addWidget(self.land_check)
         land_l.addWidget(self.land_spin)
@@ -3685,6 +3729,12 @@ class LeftPanel(QWidget):
         self._cmd_identity_lbl.setText(f"Color identity: {pip_html}  ({name_str})")
         self._cmd_identity_lbl.setTextFormat(Qt.RichText)
 
+        # Auto-populate the tribe text field from the commander's primary tribe
+        plan = dgc.infer_commander_plan(card)
+        tribe = plan.get("primary_tribe")
+        if tribe and not self.strict_tribal_edit.text().strip():
+            self.strict_tribal_edit.setText(tribe.title())
+
     def _on_archetype_changed(self, idx: int):
         arch = self.archetype_combo.currentData()
         self.archetype_desc.setText(ARCHETYPE_DESCS.get(arch, ""))
@@ -3721,6 +3771,8 @@ class LeftPanel(QWidget):
             "generations":    gens,
             "diversity":      diversity,
             "candidate_decks": candidate_decks,
+            "strict_tribal":       self.strict_tribal_check.isChecked(),
+            "strict_tribal_type":  self.strict_tribal_edit.text().strip().lower() or None,
         }
 
         if self.land_check.isChecked():

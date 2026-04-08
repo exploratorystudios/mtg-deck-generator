@@ -265,35 +265,44 @@ def build_strategy_matchers(strategy_words: list[str]) -> list[tuple]:
     """
     Compile per-word regex matchers for strategy scoring.
 
-    Returns a list of (type_line_pattern | None, [oracle_patterns], word) tuples.
-    Words in STRATEGY_ORACLE_ALIASES use oracle-text expansion patterns;
-    all others use singular/plural word-boundary matching across type_line and oracle.
+    Returns a list of (type_pat, oracle_pats, expanded_word, orig_keywords) tuples
+    where orig_keywords is a frozenset of the user-entered words that produced this
+    expanded sub-keyword. Duplicate expansions are merged so each oracle pattern is
+    only evaluated once, but all originating keywords are tracked for coherence scoring.
     """
-    matchers = []
+    # expanded_word → {type_pat, oracle_pats, originals: set}
+    expanded_map: dict[str, dict] = {}
     for w in strategy_words:
         for expanded in _expand_strategy_keyword(w):
             wl = expanded.lower()
-            if wl in STRATEGY_ORACLE_ALIASES:
-                oracle_pats = [re.compile(p, re.IGNORECASE) for p in STRATEGY_ORACLE_ALIASES[wl]]
-                type_pat = (
-                    re.compile(STRATEGY_TYPE_ALIASES[wl], re.IGNORECASE)
-                    if wl in STRATEGY_TYPE_ALIASES else None
-                )
-                matchers.append((type_pat, oracle_pats, expanded))
-            elif wl in STRATEGY_TYPE_ALIASES:
-                type_pat = re.compile(STRATEGY_TYPE_ALIASES[wl], re.IGNORECASE)
-                matchers.append((type_pat, [], expanded))
-            else:
-                word_pat = re.compile(r'\b' + re.escape(wl.rstrip('s')) + r's?\b', re.IGNORECASE)
-                matchers.append((word_pat, [word_pat], expanded))
-    return matchers
+            if wl not in expanded_map:
+                if wl in STRATEGY_ORACLE_ALIASES:
+                    oracle_pats = [re.compile(p, re.IGNORECASE) for p in STRATEGY_ORACLE_ALIASES[wl]]
+                    type_pat = (
+                        re.compile(STRATEGY_TYPE_ALIASES[wl], re.IGNORECASE)
+                        if wl in STRATEGY_TYPE_ALIASES else None
+                    )
+                elif wl in STRATEGY_TYPE_ALIASES:
+                    type_pat = re.compile(STRATEGY_TYPE_ALIASES[wl], re.IGNORECASE)
+                    oracle_pats = []
+                else:
+                    word_pat = re.compile(r'\b' + re.escape(wl.rstrip('s')) + r's?\b', re.IGNORECASE)
+                    type_pat = word_pat
+                    oracle_pats = [word_pat]
+                expanded_map[wl] = {"type_pat": type_pat, "oracle_pats": oracle_pats, "originals": set()}
+            expanded_map[wl]["originals"].add(w)
+
+    return [
+        (info["type_pat"], info["oracle_pats"], expanded, frozenset(info["originals"]))
+        for expanded, info in expanded_map.items()
+    ]
 
 
 def card_matches_strategy(card: dict, matchers: list[tuple]) -> bool:
     """Return True if the card matches any strategy matcher (type_line or oracle)."""
     type_line = card.get("type_line") or ""
     oracle = card.get("oracle_text") or ""
-    for type_pat, oracle_pats, _w in matchers:
+    for type_pat, oracle_pats, _w, *_ in matchers:
         if type_pat and type_pat.search(type_line):
             return True
         if any(p.search(oracle) for p in oracle_pats):
@@ -3331,6 +3340,7 @@ def select_nonlands(
     diversity: float = 1.0,
     commander: dict | None = None,
     plan_profile: dict[str, object] | None = None,
+    strict_tribal: bool = False,
 ) -> list[dict]:
     """
     Curve-first card selection with role weighting and synergy awareness.
@@ -3355,6 +3365,11 @@ def select_nonlands(
     support_tags: frozenset[str] = frozenset(priority_profile.get("support_tags", frozenset()))
     redundancy_targets: dict[str, int] = dict(priority_profile.get("redundancy_targets", {}))
 
+    # ── Strict tribal: raise tribe density target and penalize non-tribe creatures ──
+    if strict_tribal and primary_tribe:
+        tribe_tag = f"tribe_{primary_tribe}"
+        redundancy_targets[tribe_tag] = max(redundancy_targets.get(tribe_tag, 0), 30)
+
     # ── Merge user strategy with commander auto-strategy ──────────────────────
     auto_strat = commander_auto_strategy(commander) if commander else ""
     combined_hint = f"{strategy_hint} {auto_strat}".strip()
@@ -3373,6 +3388,20 @@ def select_nonlands(
         if rarity_idx(c) <= max_rarity_idx
         and c.get("name") != commander_name   # commander lives in command zone
     ]
+
+    # ── Strict tribal: hard-filter non-tribe creatures out of the pool ────────
+    # Penalties alone can't prevent non-tribe creatures from sneaking in during
+    # role-fill and backfill when tribe options run out. Removing them from the
+    # pool entirely is the only reliable guarantee. Non-creature cards (ramp,
+    # draw, removal, enchantments, artifacts) are always kept.
+    if strict_tribal and primary_tribe:
+        _tribe_tag = f"tribe_{primary_tribe}"
+        filtered = [
+            c for c in filtered
+            if "Creature" not in (c.get("type_line") or "")
+            or _tribe_tag in tag_index.get(c.get("name", ""), frozenset())
+        ]
+
     package_profile = choose_active_packages(plan_profile, filtered, tag_index)
     allowed_package_tags: frozenset[str] = frozenset(package_profile.get("allowed_tags", frozenset()))
     discouraged_package_tags: frozenset[str] = frozenset(package_profile.get("discouraged_tags", frozenset()))
@@ -3386,15 +3415,25 @@ def select_nonlands(
         type_line = card.get("type_line") or ""
         oracle = card.get("oracle_text") or ""
         name = card.get("name") or ""
-        score = 0.0
-        for type_pat, oracle_pats, _w in _strat_matchers:
+        matched_groups: set[str] = set()
+        base = 0.0
+        for type_pat, oracle_pats, _w, orig_words in _strat_matchers:
             if type_pat and type_pat.search(type_line):
-                score += 3.0   # IS a tribal member / has the type
+                base += 3.0
+                matched_groups.update(orig_words)
             elif any(p.search(oracle) for p in oracle_pats):
-                score += 1.5   # oracle text matches (keyword ability or alias)
+                base += 1.5
+                matched_groups.update(orig_words)
             elif type_pat and type_pat.search(name):
-                score += 0.5   # keyword appears in card name only
-        return score
+                base += 0.5
+                matched_groups.update(orig_words)
+        # Coherence multiplier: a card satisfying N distinct user-entered keywords
+        # scores geometrically higher, pulling intersection cards strongly to the top.
+        # 1 keyword → 1.0x  |  2 → 1.7x  |  3 → 2.4x  |  4 → 3.1x
+        n = len(matched_groups)
+        if n >= 2:
+            base *= 1.0 + 0.7 * (n - 1)
+        return base
 
     # ── Composite score ───────────────────────────────────────────────────────
     def composite(card: dict) -> float:
@@ -3458,6 +3497,9 @@ def select_nonlands(
             struct_pen += 1.1
         if discouraged_package_tags and card_tags & discouraged_package_tags and not (card_tags & allowed_package_tags):
             struct_pen -= 1.6
+
+        # (Strict tribal creature filtering is handled by hard pool exclusion
+        # above — non-tribe creatures never reach composite() when enabled.)
 
         # Combo pool pull: if this card is a known combo piece and its partner
         # exists in the candidate pool, give a pre-selection bonus so both pieces
@@ -4071,6 +4113,7 @@ def evolutionary_refine(
     commander: dict | None = None,
     land_count: int | None = None,
     plan_profile: dict[str, object] | None = None,
+    strict_tribal: bool = False,
 ) -> list[dict]:
     """Mutation-based evolutionary refinement with limited exploratory moves."""
     current = list(nonlands)
@@ -4085,10 +4128,22 @@ def evolutionary_refine(
 
     # Respect max CMC constraint during mutation; never allow the commander back in
     _evo_commander_name = commander.get("name") if commander else None
+    _evo_primary_tribe: str | None = (plan_profile or {}).get("primary_tribe")
     eligible_pool = [
         c for c in candidate_pool
         if get_cmc(c) <= max_cmc and c.get("name") != _evo_commander_name
     ]
+
+    # Strict tribal: purge non-tribe creatures from the replacement pool so
+    # evolution can only swap in tribe members (non-creatures are kept).
+    if strict_tribal and _evo_primary_tribe:
+        _evo_tribe_tag = f"tribe_{_evo_primary_tribe}"
+        eligible_pool = [
+            c for c in eligible_pool
+            if "Creature" not in (c.get("type_line") or "")
+            or _evo_tribe_tag in tag_index.get(c.get("name", ""), frozenset())
+        ]
+
     candidates = [c for c in eligible_pool if c["name"] not in current_names]
 
     # Per-card score for picking weakest: power + archetype + strategy
@@ -4120,6 +4175,8 @@ def evolutionary_refine(
                 c, deck_state, format_name="commander"
             )
             base -= req_penalty
+        # (Non-tribe creatures are excluded from eligible_pool when strict_tribal
+        # is active, so no per-card penalty is needed here.)
         return base
 
     base_candidate_scores: dict[str, float] = {
@@ -4246,6 +4303,7 @@ def generate_commander_candidates(
     no_evolve: bool,
     plan_profile: dict[str, object],
     num_candidates: int = 6,
+    strict_tribal: bool = False,
 ) -> tuple[list[dict], int]:
     """
     Generate multiple candidate decks and keep the best deck per shape bucket.
@@ -4266,6 +4324,7 @@ def generate_commander_candidates(
             diversity=diversity,
             commander=commander,
             plan_profile=plan_profile,
+            strict_tribal=strict_tribal,
         )
         land_count = estimate_commander_land_count(seed_nonlands, commander, archetype, plan_profile)
         nonland_slots = COMMANDER_MAIN_SIZE - land_count
@@ -4275,6 +4334,7 @@ def generate_commander_candidates(
             diversity=diversity,
             commander=commander,
             plan_profile=plan_profile,
+            strict_tribal=strict_tribal,
         )
         if not no_evolve:
             candidate = evolutionary_refine(
@@ -4285,6 +4345,7 @@ def generate_commander_candidates(
                 commander=commander,
                 land_count=land_count,
                 plan_profile=plan_profile,
+                strict_tribal=strict_tribal,
             )
 
         fitness = deck_fitness(
@@ -4954,6 +5015,8 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
     diversity = params.get("diversity", 1.0)
     commander_name = params["commander_name"]
     candidate_decks = params.get("candidate_decks", 6)
+    strict_tribal = params.get("strict_tribal", False)
+    strict_tribal_type: str | None = params.get("strict_tribal_type") or None
 
     if seed is not None:
         random.seed(seed)
@@ -4978,6 +5041,19 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
     colors = get_color_identity(commander) or {"C"}
     auto = commander_auto_strategy(commander)
     plan_profile = infer_commander_plan(commander)
+
+    # If the user specified a tribe override, inject it into the plan profile
+    # so all downstream scoring treats it as the primary tribe.
+    if strict_tribal and strict_tribal_type:
+        plan_profile = dict(plan_profile)
+        plan_profile["primary_tribe"] = strict_tribal_type
+        tribe_tag = f"tribe_{strict_tribal_type}"
+        required_tags = dict(plan_profile.get("required_tags", {}))
+        required_tags[tribe_tag] = max(required_tags.get(tribe_tag, 0), 20)
+        plan_profile["required_tags"] = required_tags
+        plans = set(plan_profile.get("plans", frozenset()))
+        plans.add("tribal_synergy")
+        plan_profile["plans"] = frozenset(plans)
 
     _p(f"Classifying {len(db):,} cards…", 15)
     tag_index = {
@@ -5011,6 +5087,7 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
             strat, nonland_slots, rarity,
             diversity=diversity,
             commander=commander,
+            strict_tribal=strict_tribal,
         )
         strat_words = list({
             *extract_strategy_terms(strat),
@@ -5026,6 +5103,7 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
                 commander=commander,
                 land_count=land_count,
                 plan_profile=plan_profile,
+                strict_tribal=strict_tribal,
             )
     else:
         _p(f"Selecting nonland cards (~{COMMANDER_MAIN_SIZE - cfg['land_count']} slots)…", 30)
@@ -5038,6 +5116,7 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
             no_evolve=no_evo,
             plan_profile=plan_profile,
             num_candidates=candidate_decks,
+            strict_tribal=strict_tribal,
         )
 
     _p("Building mana base…", 85)
