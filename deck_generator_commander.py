@@ -325,16 +325,58 @@ def build_strategy_matchers(strategy_words: list[str]) -> list[tuple]:
     ]
 
 
-def card_matches_strategy(card: dict, matchers: list[tuple]) -> bool:
-    """Return True if the card matches any strategy matcher (type_line or oracle)."""
+def strategy_match_groups(card: dict, matchers: list[tuple]) -> frozenset[str]:
+    """Return the user-entered strategy groups matched by this card."""
     type_line = card.get("type_line") or ""
     oracle = card.get("oracle_text") or ""
-    for type_pat, oracle_pats, _w, *_ in matchers:
+    name = card.get("name") or ""
+    matched_groups: set[str] = set()
+    for type_pat, oracle_pats, _w, orig_words in matchers:
         if type_pat and type_pat.search(type_line):
-            return True
-        if any(p.search(oracle) for p in oracle_pats):
-            return True
-    return False
+            matched_groups.update(orig_words)
+        elif any(p.search(oracle) for p in oracle_pats):
+            matched_groups.update(orig_words)
+        elif type_pat and type_pat.search(name):
+            matched_groups.update(orig_words)
+    return frozenset(matched_groups)
+
+
+def strategy_blend_multiplier(
+    matched_groups: frozenset[str],
+    strategy_counts: Counter,
+    selection_size: int,
+    nonland_slots: int,
+) -> float:
+    """
+    Reward cards that reinforce the dominant current strategy cluster.
+
+    If the user supplied strategy terms, a card that strengthens the deck's
+    emerging keyword focus should outperform a card that merely matches an
+    isolated or weakly represented keyword.
+    """
+    if selection_size < 8 or not matched_groups:
+        return 1.0
+
+    dominant = max(strategy_counts.values(), default=0)
+    if dominant <= 0:
+        return 1.0
+
+    avg_group = sum(strategy_counts.values()) / max(len(strategy_counts), 1)
+    matched_score = sum(int(strategy_counts.get(group, 0)) for group in matched_groups) / max(len(matched_groups), 1)
+    fill_ratio = min(1.0, selection_size / max(nonland_slots, 1))
+    coherence = (matched_score - avg_group) / max(dominant, 1)
+    multiplier = 1.0 + coherence * (0.18 + 0.12 * fill_ratio)
+
+    # Intersection cards deserve extra weight once the deck's theme is visible.
+    if len(matched_groups) >= 2:
+        multiplier += min(0.10, 0.04 * (len(matched_groups) - 1))
+
+    return max(0.82, min(1.28, multiplier))
+
+
+def card_matches_strategy(card: dict, matchers: list[tuple]) -> bool:
+    """Return True if the card matches any strategy matcher (type_line or oracle)."""
+    return bool(strategy_match_groups(card, matchers))
 
 
 # ── Change 2: Format-legality filter constants ──────────────────────────────
@@ -450,32 +492,30 @@ def commander_auto_strategy(commander: dict) -> str:
                 if st and len(st) > 2 and st not in {"the", "and", "of"}:
                     hints.add(st)
 
-    # Mechanic detection from oracle text
-    if re.search(r"sacrifice|when .{0,30} dies", oracle):
+    # Mechanic detection from oracle text.
+    # Keep this intentionally conservative: auto-strategy should describe the
+    # commander's primary engine, not every incidental rider in the textbox.
+    if re.search(r"sacrifice (another|a|an|target)|whenever .{0,30} you control dies", oracle):
         hints.add("sacrifice")
-    if re.search(r"graveyard|flashback|escape|unearth|from your graveyard", oracle):
+    if re.search(r"from your graveyard|return .{0,30} graveyard|cast .{0,30} from your graveyard|whenever .{0,30} leaves your graveyard", oracle):
         hints.add("graveyard")
-    if re.search(r"create .{0,30}token|token creature", oracle):
+    if re.search(r"create .{0,30}token|tokens? you control", oracle):
         hints.add("tokens")
-    if re.search(r"\+1/\+1 counter|proliferate|put .{0,20}counter", oracle):
+    if re.search(r"\+1/\+1 counter|proliferate|put (?:one or more |a |an )?.{0,20}counter.{0,20} on", oracle):
         hints.add("counters")
     if re.search(r"whenever you gain life|you gain \d+ life", oracle):
         hints.add("lifegain")
-    if re.search(r"whenever you cast|prowess|instant or sorcery", oracle):
+    if re.search(r"whenever you cast an? (?:instant|sorcery|spell)|magecraft|prowess|copy target spell", oracle):
         hints.add("spells")
-    if re.search(r"whenever .{0,30}artifact|affinity|improvise", oracle):
+    if re.search(r"artifact spells? you cast|whenever .{0,30}artifact enters|artifacts? you control|affinity for artifacts|improvise", oracle):
         hints.add("artifacts")
-    if re.search(r"constellation|whenever .{0,20}enchantment", oracle):
+    if re.search(r"constellation|enchantments? you control|whenever .{0,20}enchantment enters", oracle):
         hints.add("enchantments")
     if re.search(r"whenever .{0,30}land enters|landfall", oracle):
         hints.add("landfall")
-    if re.search(r"explore|venture into the dungeon|discover", oracle):
-        hints.add("explore")
-    if re.search(r"draw a card|whenever you draw", oracle):
-        hints.add("draw")
-    if re.search(r"discard|whenever you discard", oracle):
-        hints.add("discard")
-    if re.search(r"whenever a creature dies|death trigger|whenever .{0,30} dies", oracle):
+    if re.search(r"enters the battlefield|whenever .{0,30} enters the battlefield|flicker|blink", oracle):
+        hints.add("etb")
+    if re.search(r"whenever a creature dies|whenever .{0,30} dies", oracle):
         hints.add("sacrifice")
 
     return " ".join(sorted(hints))
@@ -2533,7 +2573,7 @@ def _weighted_pick(
     available = [(sc, card) for sc, card in scored_cards if card["name"] not in excluded]
     if not available:
         return None
-    window = min(len(available), max(8, int(8 + diversity * 10)))
+    window = min(len(available), max(5, int(5 + diversity * 6)))
     shortlist = available[:window]
 
     adjusted: list[tuple[float, dict]] = []
@@ -3370,6 +3410,80 @@ def archetype_blend_multiplier(
     return max(0.88, min(1.22, multiplier))
 
 
+def archetype_coherence_score(cards: list[dict], archetype: str) -> float:
+    """Return a normalized score for how concentrated the deck is in archetype role clusters."""
+    clusters = ARCHETYPE_ROLE_CLUSTERS.get(archetype, ())
+    if not clusters or not cards:
+        return 1.0
+
+    cluster_hits: Counter = Counter()
+    covered_cards = 0
+    for card in cards:
+        roles = set(classify_roles(card))
+        matched = False
+        for name, cluster_roles in clusters:
+            if roles & cluster_roles:
+                cluster_hits[name] += 1
+                matched = True
+        if matched:
+            covered_cards += 1
+
+    if covered_cards <= 0:
+        return 1.0
+
+    dominant = max(cluster_hits.values(), default=0) / covered_cards
+    support = sum(cluster_hits.values()) / max(covered_cards, 1)
+    return max(0.0, min(1.0, dominant * 0.75 + min(1.0, support / 1.8) * 0.25))
+
+
+def strategy_coherence_metrics(cards: list[dict], matchers: list[tuple]) -> dict[str, float]:
+    """Return coverage and concentration metrics for user strategy alignment."""
+    if not cards or not matchers:
+        return {
+            "match_rate": 0.0,
+            "coherence": 0.0,
+            "off_strategy_rate": 1.0,
+            "intersection_rate": 0.0,
+        }
+
+    group_counts: Counter = Counter()
+    matched_cards = 0
+    off_strategy_cards = 0
+    intersection_cards = 0
+
+    for card in cards:
+        groups = strategy_match_groups(card, matchers)
+        if groups:
+            matched_cards += 1
+            if len(groups) >= 2:
+                intersection_cards += 1
+            for group in groups:
+                group_counts[group] += 1
+        else:
+            off_strategy_cards += 1
+
+    if not group_counts:
+        return {
+            "match_rate": 0.0,
+            "coherence": 0.0,
+            "off_strategy_rate": 1.0,
+            "intersection_rate": 0.0,
+        }
+
+    total_group_hits = sum(group_counts.values())
+    dominant_ratio = max(group_counts.values()) / max(total_group_hits, 1)
+    concentration = sum((count / total_group_hits) ** 2 for count in group_counts.values())
+    baseline = 1.0 / max(len(group_counts), 1)
+    coherence = 1.0 if len(group_counts) == 1 else (concentration - baseline) / max(1e-9, 1.0 - baseline)
+
+    return {
+        "match_rate": matched_cards / max(len(cards), 1),
+        "coherence": max(0.0, min(1.0, coherence * 0.65 + dominant_ratio * 0.35)),
+        "off_strategy_rate": off_strategy_cards / max(len(cards), 1),
+        "intersection_rate": intersection_cards / max(len(cards), 1),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ARCHETYPE STRUCTURE VALIDATION
 # Hard deck-level expectations used by selection and evolutionary refinement.
@@ -3646,18 +3760,15 @@ def select_nonlands(
         type_line = card.get("type_line") or ""
         oracle = card.get("oracle_text") or ""
         name = card.get("name") or ""
-        matched_groups: set[str] = set()
+        matched_groups = strategy_match_groups(card, _strat_matchers)
         base = 0.0
-        for type_pat, oracle_pats, _w, orig_words in _strat_matchers:
+        for type_pat, oracle_pats, _w, _orig_words in _strat_matchers:
             if type_pat and type_pat.search(type_line):
                 base += 3.0
-                matched_groups.update(orig_words)
             elif any(p.search(oracle) for p in oracle_pats):
                 base += 1.5
-                matched_groups.update(orig_words)
             elif type_pat and type_pat.search(name):
                 base += 0.5
-                matched_groups.update(orig_words)
         # Coherence multiplier: a card satisfying N distinct user-entered keywords
         # scores geometrically higher, pulling intersection cards strongly to the top.
         # 1 keyword → 1.0x  |  2 → 1.7x  |  3 → 2.4x  |  4 → 3.1x
@@ -3807,6 +3918,7 @@ def select_nonlands(
     selected_subtype_counts: Counter = Counter()
     selected_type_counts: Counter = Counter()
     selected_role_counts: Counter = Counter()
+    selected_strategy_counts: Counter = Counter()
     selected_multicolor_creatures = 0
     # Count cards added that touch no core/support/finisher tag — used by the
     # filler-budget escalation inside _selection_need_bonus.
@@ -3841,6 +3953,9 @@ def select_nonlands(
                 selected_type_counts[type_word] += copies
         for role in set(classify_roles(card)):
             selected_role_counts[role] += copies
+        if _strat_matchers:
+            for group in strategy_match_groups(card, _strat_matchers):
+                selected_strategy_counts[group] += copies
         if "Creature" in (card.get("type_line") or "") and len(card.get("color_identity") or []) >= 2:
             selected_multicolor_creatures += copies
         if not (tag_index.get(name, frozenset()) & (core_tags | support_tags | finisher_tags)):
@@ -3911,9 +4026,9 @@ def select_nonlands(
             # Scales from −1.2 (plan empty, a little filler is fine early)
             #         to   −2.5 (plan complete, strong pressure against filler)
             base_penalty = 1.2 + plan_completion * 1.3
-            # Filler budget escalation: the first ~8 off-plan cards are tolerated;
+            # Filler budget escalation: the first ~6 off-plan cards are tolerated;
             # beyond that each additional one raises the penalty progressively.
-            _filler_budget = 8
+            _filler_budget = 6
             if selected_filler_count >= _filler_budget:
                 overage = selected_filler_count - _filler_budget
                 base_penalty += 0.4 + overage * 0.25
@@ -3922,6 +4037,19 @@ def select_nonlands(
             bonus += 0.75
         if discouraged_package_tags and card_tags & discouraged_package_tags and not (card_tags & allowed_package_tags):
             bonus -= 1.0
+        if _strat_matchers:
+            matched_groups = strategy_match_groups(card, _strat_matchers)
+            if matched_groups:
+                strategy_base = strat_bonus(card)
+                strategy_blend = strategy_blend_multiplier(
+                    matched_groups,
+                    selected_strategy_counts,
+                    len(selected_names),
+                    nonland_slots,
+                )
+                bonus += strategy_base * (strategy_blend - 1.0)
+            elif selected_names and len(selected_names) >= max(8, nonland_slots // 6):
+                bonus -= 0.8 + min(1.2, len(selected_names) / max(nonland_slots, 1))
         # Engine flow critical gap: if the current plan has a tier below 50%
         # satisfied, heavily reward cards that fill it so the chain gets built.
         if _primary_plan and len(selected_names) >= 6:
@@ -4201,12 +4329,19 @@ def deck_fitness(
     ))
     effective_curve_score = 1.0 / (1.0 + effective_curve_dist / 10.0)
 
-    # Strategy alignment: fraction of deck cards that match any strategy keyword
+    # Strategy alignment: reward both raw coverage and concentration around a
+    # coherent keyword cluster instead of treating all one-off matches equally.
     strat_score = 0.0
+    strat_coherence_score = 0.0
+    strat_intersection_score = 0.0
+    off_strategy_rate = 1.0
     if strategy_words:
         matchers = build_strategy_matchers(strategy_words)
-        hits = sum(1 for c in cards if card_matches_strategy(c, matchers))
-        strat_score = hits / max(len(cards), 1)
+        strat_metrics = strategy_coherence_metrics(cards, matchers)
+        strat_score = strat_metrics["match_rate"]
+        strat_coherence_score = strat_metrics["coherence"]
+        strat_intersection_score = strat_metrics["intersection_rate"]
+        off_strategy_rate = strat_metrics["off_strategy_rate"]
 
     # Orphaned payoff penalty: payoff cards with no matching enablers in the deck
     # reduces fitness — the evolutionary phase will tend to replace them
@@ -4239,6 +4374,7 @@ def deck_fitness(
     priority_profile = derive_priority_profile(plan_profile)
     package_profile = choose_active_packages(plan_profile, cards, tag_index)
     structure_report = evaluate_archetype_structure(cards, tag_index, archetype)
+    archetype_coherence = archetype_coherence_score(cards, archetype)
     sim_land_count = land_count if land_count is not None else estimate_commander_land_count(cards, commander, archetype, plan_profile)
     sim = simulate_commander_goldfish(cards, commander, sim_land_count, tag_index, plan_profile=plan_profile)
     color_pressure = estimate_color_pressure(cards, deck_colors, sim_land_count)
@@ -4314,9 +4450,13 @@ def deck_fitness(
         plan_penalty += (max(6, len(cards) // 6) - core_hits) * 0.18
     if support_tags and support_hits < max(4, len(cards) // 8):
         plan_penalty += (max(4, len(cards) // 8) - support_hits) * 0.10
-    offplan_allowance = max(10, len(cards) // 3)
+    offplan_allowance = max(6, len(cards) // 5)
     if offplan_hits > offplan_allowance:
-        plan_penalty += (offplan_hits - offplan_allowance) * 0.08
+        plan_penalty += (offplan_hits - offplan_allowance) * 0.22
+    plan_penalty += max(0.0, 0.72 - archetype_coherence) * 6.0
+    if strategy_words:
+        plan_penalty += max(0.0, off_strategy_rate - 0.28) * 7.5
+        plan_penalty += max(0.0, 0.45 - strat_coherence_score) * 3.5
     if allowed_package_tags:
         package_hits = sum(1 for c in cards if tag_index.get(c["name"], frozenset()) & allowed_package_tags)
         if package_hits < max(14, len(cards) // 3):
@@ -4355,12 +4495,15 @@ def deck_fitness(
             synergy          * 0.14 +
             curve_score * 10 * 0.11 +
             effective_curve_score * 10 * 0.09 +
-            strat_score * 10 * 0.18 +
+            strat_score * 10 * 0.14 +
+            strat_coherence_score * 2.4 +
+            strat_intersection_score * 1.2 +
             sim_score        * 0.14 +
             quadrant_score   * 0.09
             + narrow_adjustment
             + support_adjustment
             + redundancy_bonus
+            + archetype_coherence * 1.8
             + engine_flow_score
             + win_con_score
             - orphan_penalty
@@ -4381,6 +4524,7 @@ def deck_fitness(
         + narrow_adjustment
         + support_adjustment
         + redundancy_bonus
+        + archetype_coherence * 1.8
         + engine_flow_score
         + win_con_score
         - orphan_penalty
@@ -4471,6 +4615,37 @@ def evolutionary_refine(
         # is active, so no per-card penalty is needed here.)
         return base
 
+    def dynamic_theme_bonus(
+        c: dict,
+        deck_state: dict[str, object],
+        strategy_counts: Counter,
+    ) -> float:
+        bonus = 0.0
+        roles = classify_roles(c)
+        arch_fit = score_archetype_fit(c, archetype, roles)
+        arch_blend = archetype_blend_multiplier(
+            roles,
+            archetype,
+            deck_state["role_counts"],
+            len(current),
+            len(current),
+        )
+        bonus += arch_fit * 3.0 * (arch_blend - 1.0)
+        if _evo_matchers:
+            matched_groups = strategy_match_groups(c, _evo_matchers)
+            if matched_groups:
+                strategy_base = 6.0
+                strategy_blend = strategy_blend_multiplier(
+                    matched_groups,
+                    strategy_counts,
+                    len(current),
+                    len(current),
+                )
+                bonus += strategy_base * (strategy_blend - 1.0)
+            else:
+                bonus -= 1.0
+        return bonus
+
     base_candidate_scores: dict[str, float] = {
         c["name"]: card_score(c) for c in eligible_pool
     }
@@ -4483,6 +4658,11 @@ def evolutionary_refine(
         current_state = build_deck_state(
             current, tag_index, classify_roles, get_subtypes, commander=commander
         )
+        current_strategy_counts: Counter = Counter()
+        if _evo_matchers:
+            for card in current:
+                for group in strategy_match_groups(card, _evo_matchers):
+                    current_strategy_counts[group] += 1
         card_scores = [
             (i, card_score(c, current_state))
             for i, c in enumerate(current)
@@ -4527,7 +4707,13 @@ def evolutionary_refine(
             if noncreature_sampled and is_creature(removed_card):
                 sampled = noncreature_sampled
         candidate_scores = sorted(
-            ((base_candidate_scores[c["name"]], c) for c in sampled),
+            (
+                (
+                    base_candidate_scores[c["name"]] + dynamic_theme_bonus(c, current_state, current_strategy_counts),
+                    c,
+                )
+                for c in sampled
+            ),
             key=lambda x: -x[0],
         )
         replacement = _weighted_pick(candidate_scores, set(), diversity)
