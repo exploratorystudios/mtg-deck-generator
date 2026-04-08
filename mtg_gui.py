@@ -2893,17 +2893,24 @@ class GeneratorWorker(QThread):
             db = dg.load_card_database()
 
             self.signals.progress.emit(f"Classifying {len(db):,} cards…", 15)
-            tag_index = {name: dg.detect_synergy_tags(card) for name, card in db.items()}
+            tag_index = {
+                name: dg.detect_synergy_tags(card) | frozenset(dg.classify_roles(card))
+                for name, card in db.items()
+            }
 
             all_nonlands = [
                 card for card in db.values()
                 if not dg.is_land(card) and dg.fits_colors(card, colors)
             ]
             all_lands = [card for card in db.values() if dg.is_land(card)]
+            _land_fits_identity = getattr(dg, "fits_color_identity", dg.fits_colors)
             usable_lands = [
                 land for land in all_lands
-                if (dg.land_produces(land) & colors) or
-                   ("Basic" in (land.get("type_line") or "") and not dg.land_produces(land))
+                if _land_fits_identity(land, colors)
+                and (
+                    (dg.land_produces(land) & colors) or
+                    ("Basic" in (land.get("type_line") or "") and not dg.land_produces(land))
+                )
             ]
 
             self.signals.progress.emit(
@@ -3038,6 +3045,11 @@ class BrawlGeneratorWorker(QThread):
             gens           = p["generations"]
             diversity      = p.get("diversity", 1.0)
             commander_name = p["commander_name"]
+            strict_tribal  = p.get("strict_tribal", False)
+            strict_tribal_type = p.get("strict_tribal_type") or None
+            ignore_tribal  = p.get("ignore_tribal", False)
+            if strict_tribal:
+                ignore_tribal = False
 
             if seed is not None:
                 random.seed(seed)
@@ -3070,10 +3082,14 @@ class BrawlGeneratorWorker(QThread):
                 if not dgb.is_land(card) and dgb.fits_color_identity(card, colors)
             ]
             all_lands = [card for card in db.values() if dgb.is_land(card)]
+            _land_fits_identity = getattr(dgb, "fits_color_identity", dgb.fits_colors)
             usable_lands = [
                 land for land in all_lands
-                if (dgb.land_produces(land) & colors) or
-                   ("Basic" in (land.get("type_line") or "") and not dgb.land_produces(land))
+                if _land_fits_identity(land, colors)
+                and (
+                    (dgb.land_produces(land) & colors) or
+                    ("Basic" in (land.get("type_line") or "") and not dgb.land_produces(land))
+                )
             ]
 
             self.signals.progress.emit(
@@ -3194,6 +3210,11 @@ class CommanderGeneratorWorker(QThread):
             gens           = p["generations"]
             diversity      = p.get("diversity", 1.0)
             commander_name = p["commander_name"]
+            strict_tribal  = p.get("strict_tribal", False)
+            strict_tribal_type = p.get("strict_tribal_type") or None
+            ignore_tribal  = p.get("ignore_tribal", False)
+            if strict_tribal:
+                ignore_tribal = False
 
             if seed is not None:
                 random.seed(seed)
@@ -3217,9 +3238,26 @@ class CommanderGeneratorWorker(QThread):
                 return
 
             colors = dgc.get_color_identity(commander) or {"C"}
+            auto = dgc.commander_auto_strategy(commander, ignore_tribal=ignore_tribal)
+            plan_profile = dgc.infer_commander_plan(commander)
+            if ignore_tribal:
+                plan_profile = dgc.remove_tribal_plan_bias(plan_profile)
+            if strict_tribal and strict_tribal_type:
+                plan_profile = dict(plan_profile)
+                plan_profile["primary_tribe"] = strict_tribal_type
+                tribe_tag = f"tribe_{strict_tribal_type}"
+                required_tags = dict(plan_profile.get("required_tags", {}))
+                required_tags[tribe_tag] = max(required_tags.get(tribe_tag, 0), 20)
+                plan_profile["required_tags"] = required_tags
+                plans = set(plan_profile.get("plans", frozenset()))
+                plans.add("tribal_synergy")
+                plan_profile["plans"] = frozenset(plans)
 
             self.signals.progress.emit(f"Classifying {len(db):,} cards…", 15)
-            tag_index = {name: dgc.detect_synergy_tags(card) for name, card in db.items()}
+            tag_index = {
+                name: dgc.detect_synergy_tags(card) | frozenset(dgc.classify_roles(card))
+                for name, card in db.items()
+            }
 
             all_nonlands = [
                 card for card in db.values()
@@ -3228,8 +3266,11 @@ class CommanderGeneratorWorker(QThread):
             all_lands = [card for card in db.values() if dgc.is_land(card)]
             usable_lands = [
                 land for land in all_lands
-                if (dgc.land_produces(land) & colors) or
-                   ("Basic" in (land.get("type_line") or "") and not dgc.land_produces(land))
+                if dgc.fits_color_identity(land, colors)
+                and (
+                    (dgc.land_produces(land) & colors) or
+                    ("Basic" in (land.get("type_line") or "") and not dgc.land_produces(land))
+                )
             ]
 
             self.signals.progress.emit(
@@ -3240,6 +3281,9 @@ class CommanderGeneratorWorker(QThread):
                 strat, nonland_slots, rarity,
                 diversity=diversity,
                 commander=commander,
+                plan_profile=plan_profile,
+                strict_tribal=strict_tribal,
+                ignore_tribal=ignore_tribal,
             )
 
             if not no_evo:
@@ -3249,10 +3293,15 @@ class CommanderGeneratorWorker(QThread):
                 selected_nonlands = dgc.evolutionary_refine(
                     selected_nonlands, all_nonlands, db, tag_index, arch, gens,
                     max_cmc=cfg.get("max_cmc", 99),
-                    strategy_words=[w for w in strat.lower().split() if w],
+                    strategy_words=list({
+                        *dgc.extract_strategy_terms(strat),
+                        *dgc.extract_strategy_terms(auto),
+                    } - {""}),
                     diversity=diversity,
                     commander=commander,
                     land_count=land_count,
+                    plan_profile=plan_profile,
+                    strict_tribal=strict_tribal,
                 )
 
             self.signals.progress.emit("Building mana base…", 85)
@@ -3290,6 +3339,9 @@ class CommanderGeneratorWorker(QThread):
                 for sub in dgc.get_subtypes(card):
                     tribe_counter[sub] += 1
             tribes = [(t, c) for t, c in tribe_counter.most_common(8) if c >= 3]
+            synergy_score, synergy_per_card = dgc.compute_synergy_rating(
+                selected_nonlands, db, tag_index, plan_profile=plan_profile
+            )
 
             avg_cmc = (
                 sum(dgc.get_cmc(c) for c in selected_nonlands)
@@ -3314,6 +3366,8 @@ class CommanderGeneratorWorker(QThread):
                 "pips":          pips,
                 "synergies":     synergies,
                 "tribes":        tribes,
+                "synergy_score": synergy_score,
+                "synergy_per_card": synergy_per_card,
                 "avg_cmc":       avg_cmc,
                 "avg_power":     avg_power,
                 "deck_text":     deck_text_plain,
@@ -3448,6 +3502,35 @@ class LeftPanel(QWidget):
         tribal_l.addWidget(self.strict_tribal_edit)
         tribal_l.addStretch()
         form.addWidget(tribal_row)
+
+        self.ignore_tribal_check = QCheckBox("Ignore tribal inference")
+        self.ignore_tribal_check.setStyleSheet("color: #8b949e; font-size: 12px;")
+        self.ignore_tribal_check.setToolTip(
+            "Disable automatic tribal steering from commander subtypes.\n"
+            "Useful when the commander has a creature type but the real plan is not tribal."
+        )
+        form.addWidget(self.ignore_tribal_check)
+
+        def _on_strict_tribal_toggled(checked: bool):
+            self.strict_tribal_edit.setEnabled(checked)
+            if checked:
+                self.ignore_tribal_check.setChecked(False)
+                self.ignore_tribal_check.setEnabled(False)
+            else:
+                self.ignore_tribal_check.setEnabled(True)
+
+        def _on_ignore_tribal_toggled(checked: bool):
+            if checked:
+                self.strict_tribal_check.setChecked(False)
+                self.strict_tribal_check.setEnabled(False)
+                self.strict_tribal_edit.setEnabled(False)
+            else:
+                self.strict_tribal_check.setEnabled(True)
+                self.strict_tribal_edit.setEnabled(self.strict_tribal_check.isChecked())
+
+        self.strict_tribal_check.toggled.disconnect()
+        self.strict_tribal_check.toggled.connect(_on_strict_tribal_toggled)
+        self.ignore_tribal_check.toggled.connect(_on_ignore_tribal_toggled)
 
         form.addWidget(Divider())
 
@@ -3732,7 +3815,11 @@ class LeftPanel(QWidget):
         # Auto-populate the tribe text field from the commander's primary tribe
         plan = dgc.infer_commander_plan(card)
         tribe = plan.get("primary_tribe")
-        if tribe and not self.strict_tribal_edit.text().strip():
+        if (
+            tribe
+            and not self.ignore_tribal_check.isChecked()
+            and not self.strict_tribal_edit.text().strip()
+        ):
             self.strict_tribal_edit.setText(tribe.title())
 
     def _on_archetype_changed(self, idx: int):
@@ -3773,6 +3860,7 @@ class LeftPanel(QWidget):
             "candidate_decks": candidate_decks,
             "strict_tribal":       self.strict_tribal_check.isChecked(),
             "strict_tribal_type":  self.strict_tribal_edit.text().strip().lower() or None,
+            "ignore_tribal":       self.ignore_tribal_check.isChecked(),
         }
 
         if self.land_check.isChecked():
@@ -4043,7 +4131,10 @@ class RightPanel(QWidget):
         # Stat cards
         self.stat_cards["Unique Cards"].set_value(str(result["card_count"]))
         n_syn = len(result["synergies"])
-        self.stat_cards["Synergy Score"].set_value(str(n_syn))
+        syn_display = result.get("synergy_score")
+        self.stat_cards["Synergy Score"].set_value(
+            str(syn_display) if syn_display is not None else str(n_syn)
+        )
         n_tribes = len(result["tribes"])
         self.stat_cards["Tribes"].set_value(str(n_tribes) if n_tribes else "—")
         self.stat_cards["Archetypes Fit"].set_value(arch.capitalize())

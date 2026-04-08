@@ -39,6 +39,7 @@ CARDS_DIR = os.path.join(os.path.dirname(__file__), "cards", "commander")
 COMMANDER_DECK_SIZE = 100   # total including commander
 COMMANDER_MAIN_SIZE = 99    # cards in the 99 (not commander)
 _GOLDFISH_CACHE: dict[tuple, dict[str, float]] = {}
+_NUMBER_WORD_RE = r"(?:\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|x|\w+)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,6 +59,7 @@ STRATEGY_ORACLE_ALIASES: dict[str, list[str]] = {
         r"put (a|that) land (card )?onto the battlefield",
         r"adds? \{[WUBRGC0-9]\}",         # any single mana pip (colored or colorless)
         r"adds? mana (of|in) (any|your)",  # e.g. Arcane Signet, Fellwar Stone
+        r"add (one|\d+|x) mana of any color",
     ],
     "draw":        [r"draw (a|two|three|four|\w+) cards?", r"scry \d+", r"surveil \d+"],
     "tutor":       [r"search your library for (?:a|an) (?:card|creature|artifact|enchantment|instant|sorcery)", r"search your library for a card"],
@@ -75,15 +77,15 @@ STRATEGY_ORACLE_ALIASES: dict[str, list[str]] = {
     "infinite":    [r"untap .{0,30}(add|mana)", r"take an extra (turn|step)", r"create \d+ cop"],
     "tokens":      [r"create (a|an|\d+) .{0,30}token", r"token creature", r"creature token"],
     "graveyard":   [r"graveyard"],
-    "sacrifice":   [r"sacrifice (a|an|target|\{0,20})", r"when .{0,30} dies", r"when .{0,30} is put into"],
-    "death_trigger":[r"when(?:ever)? .{0,30} dies", r"dies,? ", r"whenever .{0,30}is put into a graveyard"],
+    "sacrifice":   [r"sacrifice (a|an|target|\{0,20})", r"when .{0,60} dies", r"when .{0,60} is put into"],
+    "death_trigger":[r"when(?:ever)? .{0,60} dies", r"dies,? ", r"whenever .{0,60}is put into a graveyard"],
     "bounce":      [r"return target .{0,30} to (its owner.s hand|your hand|their hand)"],
     "counter":     [r"counter target (spell|ability|creature spell|noncreature spell)"],
     "removal":     [r"destroy target", r"exile target", r"target creature gets? -\d+/-\d+", r"deals? \d+ damage to target"],
     "interaction": [r"counter target", r"destroy target", r"exile target", r"return target .{0,30} to (its owner.s hand|your hand|their hand)", r"target player discards?"],
     "counters":    [r"\+1/\+1 counter", r"-1/-1 counter", r"place .{0,20} counter", r"with \d+ (additional )?\+1/\+1"],
     "proliferate": [r"proliferate"],
-    "mill":        [r"mill \d+", r"put the top .{0,30}card.{0,20}into .{0,20}graveyard", r"library into .{0,10}graveyard"],
+    "mill":        [rf"mill {_NUMBER_WORD_RE} cards?", r"mills? cards?", r"put the top .{0,30}card.{0,20}into .{0,20}graveyard", r"library into .{0,10}graveyard"],
     "discard":     [r"discard"],
     "copy":        [r"copy (of |a |target )", r"copies of", r"create a (token that is a )?copy"],
     "equipment":   [r"equip \{", r"equipment", r"equipped creature"],
@@ -473,7 +475,7 @@ def get_all_commanders(db: dict) -> list[dict]:
     )
 
 
-def commander_auto_strategy(commander: dict) -> str:
+def commander_auto_strategy(commander: dict, ignore_tribal: bool = False) -> str:
     """
     Derive automatic strategy keywords from the commander's type line and oracle text.
     Returns a space-separated string of hints to be merged with the user's strategy.
@@ -484,13 +486,14 @@ def commander_auto_strategy(commander: dict) -> str:
     keywords  = [k.lower() for k in (commander.get("keywords") or [])]
 
     # Creature subtypes → tribal hint (e.g. "Goblin Shaman" → "goblin")
-    for face_type in type_line.split("//"):
-        if "—" in face_type:
-            for st in face_type.split("—", 1)[1].strip().split():
-                st = st.strip().lower()
-                # Skip noise words and very short tokens
-                if st and len(st) > 2 and st not in {"the", "and", "of"}:
-                    hints.add(st)
+    if not ignore_tribal:
+        for face_type in type_line.split("//"):
+            if "—" in face_type:
+                for st in face_type.split("—", 1)[1].strip().split():
+                    st = st.strip().lower()
+                    # Skip noise words and very short tokens
+                    if st and len(st) > 2 and st not in {"the", "and", "of"}:
+                        hints.add(st)
 
     # Mechanic detection from oracle text.
     # Keep this intentionally conservative: auto-strategy should describe the
@@ -519,6 +522,31 @@ def commander_auto_strategy(commander: dict) -> str:
         hints.add("sacrifice")
 
     return " ".join(sorted(hints))
+
+
+def remove_tribal_plan_bias(plan_profile: dict[str, object] | None) -> dict[str, object]:
+    """Return a copy of the plan profile with tribal-only steering removed."""
+    plan_profile = dict(plan_profile or {})
+    plans = set(plan_profile.get("plans", frozenset()))
+    plans.discard("tribal_synergy")
+    plan_profile["plans"] = frozenset(plans)
+
+    primary_tribe = plan_profile.get("primary_tribe")
+    plan_profile["primary_tribe"] = None
+
+    required_tags = dict(plan_profile.get("required_tags", {}))
+    if primary_tribe:
+        required_tags.pop(f"tribe_{primary_tribe}", None)
+    plan_profile["required_tags"] = required_tags
+
+    finisher_tags = {
+        tag for tag in set(plan_profile.get("finisher_tags", frozenset({"wincon"})))
+        if not str(tag).startswith("tribe_")
+    }
+    if "wincon" not in finisher_tags:
+        finisher_tags.add("wincon")
+    plan_profile["finisher_tags"] = frozenset(finisher_tags)
+    return plan_profile
 
 
 def infer_commander_plan(commander: dict | None) -> dict[str, object]:
@@ -572,7 +600,7 @@ def infer_commander_plan(commander: dict | None) -> dict[str, object]:
         add_plan(
             "spells_velocity",
             {
-                "spells_enabler": 10,
+                "spells_enabler": 14,
                 "spells_payoff": 4,
                 "draw": 6,
             },
@@ -619,6 +647,23 @@ def infer_commander_plan(commander: dict | None) -> dict[str, object]:
             },
             {"counters", "modified_payoff"},
         )
+    # If counters are only a rider on spell-casting triggers, treat them as a
+    # subtheme of spellslinger instead of a co-equal primary engine.
+    if "spells_velocity" in plans and "counters_engine" in plans:
+        spell_counter_only = re.search(
+            r"whenever you cast (?:an? )?(?:instant|sorcery|noncreature).{0,80}counter",
+            oracle,
+        ) and not re.search(
+            r"proliferate|double .{0,20}counters?|move .{0,20}counters?|"
+            r"whenever .{0,40}(?:another creature|a creature you control|target creature).{0,30}\+1/\+1 counter",
+            oracle,
+        )
+        if spell_counter_only:
+            plans.discard("counters_engine")
+            required_tags.pop("counters", None)
+            required_tags.pop("modified_enabler", None)
+            finisher_tags.discard("modified_payoff")
+            finisher_tags.discard("counters")
 
     if re.search(r"whenever a creature enters|enters the battlefield|flicker|blink", oracle):
         add_plan(
@@ -630,9 +675,9 @@ def infer_commander_plan(commander: dict | None) -> dict[str, object]:
             {"etb_payoff", "blink_enabler"},
         )
 
-    # Tribal plan: when the commander has a creature subtype, enforce density
-    # of that tribe as a primary constraint.  We extract the first non-noise
-    # subtype from the type line (e.g. "Elf" from "Legendary Creature — Elf Noble").
+    # Tribal plan: only infer tribe when the commander text actually signals
+    # tribe-matters gameplay. A bare creature subtype (e.g. Centaur/Wizard) is
+    # not enough by itself.
     primary_tribe: str | None = None
     _noise = {"the", "and", "of"}
     for face_type in type_line.split("//"):
@@ -646,7 +691,18 @@ def infer_commander_plan(commander: dict | None) -> dict[str, object]:
         if primary_tribe:
             break
 
+    tribal_signaled = False
     if primary_tribe:
+        tribe_pat = re.escape(primary_tribe)
+        if re.search(rf"\b{tribe_pat}s?\b", oracle):
+            tribal_signaled = True
+        elif re.search(
+            r"choose a creature type|of the chosen type|share a creature type|creatures? of the chosen type",
+            oracle,
+        ):
+            tribal_signaled = True
+
+    if primary_tribe and tribal_signaled:
         tribe_tag = f"tribe_{primary_tribe}"
         add_plan(
             "tribal_synergy",
@@ -700,9 +756,8 @@ def infer_commander_plan(commander: dict | None) -> dict[str, object]:
     # Spell-cost engine: commander reduces cost of spells, enabling high spell velocity.
     # Covers: Baral, Goblin Electromancer, Jhoira, Urza, Vadrik, Zada.
     if re.search(
-        r"(?:spells?|instant|sorcery).{0,50}cost.{0,15}\{[0-9]\} less"
-        r"|spells? you cast cost .{0,10}less"
-        r"|reduce.{0,30}cost",
+        r"spells? you cast cost .{0,15}less"
+        r"|(?:instant|sorcery|noncreature|artifact|creature|legendary|historic|equipment|aura|enchantment) spells? you cast cost .{0,15}less",
         oracle,
     ):
         add_plan(
@@ -791,7 +846,7 @@ PLAN_PRIORITY_RULES: dict[str, dict[str, object]] = {
         "closure_tags": {"spells_payoff", "wincon"},
         # Raised spells_enabler target: spellslinger decks need 15+ instants/sorceries,
         # not just 9. The higher target creates selection pressure throughout all phases.
-        "redundancy": {"spells_enabler": 16, "spells_payoff": 5, "draw": 6,
+        "redundancy": {"spells_enabler": 20, "spells_payoff": 5, "draw": 6,
                        "removal": 4, "ramp": 7},
     },
     "go_wide_tokens": {
@@ -859,7 +914,7 @@ PLAN_PRIORITY_RULES: dict[str, dict[str, object]] = {
         "support_tags": {"draw", "spells_payoff", "removal", "ramp"},
         "closure_tags": {"spells_payoff", "wincon"},
         # Raised spells_enabler target to ensure a true spell-dense build
-        "redundancy": {"spells_enabler": 16, "cost_reduction": 3, "spells_payoff": 5,
+        "redundancy": {"spells_enabler": 20, "cost_reduction": 3, "spells_payoff": 5,
                        "draw": 7, "removal": 4, "ramp": 7},
     },
     "voltron_engine": {
@@ -891,7 +946,7 @@ PLAN_ENGINE_RULES: dict[str, dict[str, object]] = {
     },
     "spells_velocity": {
         "components": (
-            ("cheap_spells", frozenset({"spells_enabler"}), 9),
+            ("cheap_spells", frozenset({"spells_enabler"}), 14),
             ("payoffs", frozenset({"spells_payoff"}), 4),
             ("velocity", frozenset({"draw"}), 5),
         ),
@@ -1002,6 +1057,78 @@ PLAN_ENGINE_RULES: dict[str, dict[str, object]] = {
     },
 }
 
+_TRIBAL_STRONG_ANTAGONIST_PLANS = frozenset({
+    "spells_velocity",
+    "spell_cost_engine",
+})
+_TRIBAL_ORTHOGONAL_PLANS = frozenset({
+    "lands_engine",
+    "artifact_engine",
+    "enchantment_engine",
+    "graveyard_value",
+    "exile_zone_play",
+    "voltron_engine",
+})
+_GENERIC_INFRA_TAGS = frozenset({"draw", "removal", "ramp"})
+
+
+def _tribal_cap_for_plans(plans: frozenset[str]) -> int:
+    """Cap tribal density based on how antagonistic the companion plans are."""
+    nontribal = set(plans) - {"tribal_synergy"}
+    if not nontribal:
+        return 20
+    if nontribal & _TRIBAL_STRONG_ANTAGONIST_PLANS:
+        return 8
+    if nontribal & _TRIBAL_ORTHOGONAL_PLANS:
+        return 10
+    return 12
+
+
+def _tribal_member_target(plan_profile: dict[str, object] | None, default: int = 20) -> int:
+    primary_tribe: str | None = (plan_profile or {}).get("primary_tribe")
+    if not primary_tribe:
+        return default
+    tribe_tag = f"tribe_{primary_tribe}"
+    redundancy_targets = derive_priority_profile(plan_profile).get("redundancy_targets", {})
+    return max(6, int(redundancy_targets.get(tribe_tag, default)))
+
+
+def _tribal_alignment_ratio(
+    primary_tribe: str | None,
+    plans: list[str],
+    candidate_cards: list[dict],
+    tag_index: dict[str, frozenset[str]],
+) -> float:
+    """
+    How well tribe creatures in pool overlap non-tribal core plan tags.
+    Low ratio means tribal membership likely competes for slots without helping
+    the other active plans.
+    """
+    if not primary_tribe or not candidate_cards or not plans:
+        return 1.0
+    tribe_tag = f"tribe_{primary_tribe}"
+    tribe_creatures = [
+        c for c in candidate_cards
+        if is_creature(c) and tribe_tag in tag_index.get(c.get("name", ""), frozenset())
+    ]
+    if not tribe_creatures:
+        return 0.0
+    other_core: set[str] = set()
+    for plan in plans:
+        if plan == "tribal_synergy":
+            continue
+        rule = PLAN_PRIORITY_RULES.get(plan)
+        if not rule:
+            continue
+        other_core.update(set(rule["core_tags"]) - _GENERIC_INFRA_TAGS)
+    if not other_core:
+        return 1.0
+    hits = sum(
+        1 for c in tribe_creatures
+        if tag_index.get(c.get("name", ""), frozenset()) & other_core
+    )
+    return hits / max(1, len(tribe_creatures))
+
 
 def derive_priority_profile(plan_profile: dict[str, object] | None) -> dict[str, object]:
     plans = frozenset((plan_profile or {}).get("plans", frozenset()))
@@ -1033,21 +1160,12 @@ def derive_priority_profile(plan_profile: dict[str, object] | None) -> dict[str,
         finisher_tags.update(rule["closure_tags"])
         for tag, count in rule["redundancy"].items():
             redundancy_targets[tag] = max(redundancy_targets.get(tag, 0), count)
-    # When tribal_synergy is paired with a plan whose engine DOESN'T depend on tribal
-    # density, cap tribe count to 12 so the real engine gets enough slots.
-    # Plans that amplify tribal (go_wide, combat_damage) do NOT trigger the cap —
-    # Lathril (tribal + go_wide + combat) still needs 20 elves.
-    # Plans that are orthogonal to tribal (lands_engine, spells, artifacts, voltron)
-    # should treat tribal as a flavour layer capped at 12.
-    _TRIBAL_DILUTING_PLANS = frozenset({
-        "lands_engine", "spells_velocity", "spell_cost_engine",
-        "artifact_engine", "enchantment_engine", "graveyard_value",
-        "exile_zone_play", "voltron_engine",
-    })
-    if is_multi_plan and primary_tribe and (plans & _TRIBAL_DILUTING_PLANS):
+    # Cap tribal density based on how antagonistic companion plans are.
+    if is_multi_plan and primary_tribe:
         tribe_tag = f"tribe_{primary_tribe}"
         if tribe_tag in redundancy_targets:
-            redundancy_targets[tribe_tag] = min(12, redundancy_targets[tribe_tag])
+            cap = _tribal_cap_for_plans(plans)
+            redundancy_targets[tribe_tag] = min(cap, redundancy_targets[tribe_tag])
 
     support_tags -= core_tags
     return {
@@ -1074,6 +1192,7 @@ def choose_active_packages(
 
     primary_tribe: str | None = (plan_profile or {}).get("primary_tribe")
     pool_counts = _tag_counter_from_cards(candidate_cards, tag_index)
+    tribal_alignment = _tribal_alignment_ratio(primary_tribe, plans, candidate_cards, tag_index)
     scored_plans: list[tuple[float, str]] = []
     for plan in plans:
         rule = PLAN_PRIORITY_RULES.get(plan)
@@ -1093,6 +1212,13 @@ def choose_active_packages(
                 have = pool_counts.get(tag, 0)
                 score += min(1.0, have / max(1, target))
         score += 0.35 * sum(pool_counts.get(tag, 0) > 0 for tag in rule["closure_tags"])
+        if plan == "tribal_synergy" and "tribal_synergy" in plans and len(plans) > 1:
+            if tribal_alignment < 0.25:
+                score *= 0.48
+            elif tribal_alignment < 0.40:
+                score *= 0.62
+            elif tribal_alignment < 0.55:
+                score *= 0.78
         scored_plans.append((score, plan))
 
     if not scored_plans:
@@ -1156,6 +1282,7 @@ def plan_component_summary(
         # patch it with the actual runtime tribe tag.
         if primary == "tribal_synergy" and label == "tribe_members" and primary_tribe:
             tags = frozenset({f"tribe_{primary_tribe}"})
+            need = _tribal_member_target(plan_profile, default=need)
         have = sum(tag_counts.get(tag, 0) for tag in tags)
         ok = have >= need
         if ok:
@@ -1252,6 +1379,109 @@ def is_instant_or_sorcery(card: dict) -> bool:
     return "Instant" in tl or "Sorcery" in tl
 
 
+_SLOT_TYPES: tuple[str, str, str] = ("creature", "noncreature_spell", "other_permanent")
+
+
+def _card_slot_kind(card: dict) -> str:
+    if is_creature(card):
+        return "creature"
+    if is_instant_or_sorcery(card):
+        return "noncreature_spell"
+    return "other_permanent"
+
+
+def _normalize_slot_mix(mix: dict[str, float]) -> dict[str, float]:
+    total = sum(max(0.0, float(mix.get(k, 0.0))) for k in _SLOT_TYPES)
+    if total <= 0:
+        return {k: 1.0 / len(_SLOT_TYPES) for k in _SLOT_TYPES}
+    return {k: max(0.0, float(mix.get(k, 0.0))) / total for k in _SLOT_TYPES}
+
+
+def _slot_mix_from_cards(cards: list[dict]) -> dict[str, float]:
+    counts = {k: 0.0 for k in _SLOT_TYPES}
+    if not cards:
+        return _normalize_slot_mix(counts)
+    for card in cards:
+        counts[_card_slot_kind(card)] += 1.0
+    return _normalize_slot_mix(counts)
+
+
+def _build_tag_slot_affinity(
+    cards: list[dict],
+    tag_index: dict[str, frozenset[str]],
+    baseline_mix: dict[str, float] | None = None,
+) -> dict[str, dict[str, float]]:
+    baseline_mix = baseline_mix or _slot_mix_from_cards(cards)
+    tag_slot_counts: dict[str, dict[str, float]] = {}
+    for card in cards:
+        name = card.get("name", "")
+        if not name:
+            continue
+        slot = _card_slot_kind(card)
+        for tag in tag_index.get(name, frozenset()):
+            slot_counts = tag_slot_counts.setdefault(tag, {k: 0.0 for k in _SLOT_TYPES})
+            slot_counts[slot] += 1.0
+    affinities: dict[str, dict[str, float]] = {}
+    for tag, counts in tag_slot_counts.items():
+        # Light smoothing around baseline avoids overfitting sparse tags.
+        smoothed = {
+            k: counts.get(k, 0.0) + baseline_mix.get(k, 0.0) * 1.2 + 0.05
+            for k in _SLOT_TYPES
+        }
+        affinities[tag] = _normalize_slot_mix(smoothed)
+    return affinities
+
+
+def _slot_pressure_from_deficits(
+    tag_counts: Counter,
+    required_tags: dict[str, int],
+    redundancy_targets: dict[str, int],
+    core_tags: frozenset[str],
+    tag_slot_affinity: dict[str, dict[str, float]],
+    baseline_mix: dict[str, float],
+) -> tuple[dict[str, float], frozenset[str], float]:
+    pressure = {k: 0.0 for k in _SLOT_TYPES}
+    unmet: set[str] = set()
+    required_set = set(required_tags)
+    all_tags = required_set | set(redundancy_targets) | set(core_tags)
+    for tag in all_tags:
+        need = max(required_tags.get(tag, 0), redundancy_targets.get(tag, 0))
+        if need <= 0:
+            continue
+        have = int(tag_counts.get(tag, 0))
+        deficit = max(0, need - have)
+        if deficit <= 0:
+            continue
+        unmet.add(tag)
+        weight = 1.5 if tag in core_tags else (1.15 if tag in required_set else 0.8)
+        affinity = tag_slot_affinity.get(tag, baseline_mix)
+        for slot in _SLOT_TYPES:
+            pressure[slot] += deficit * weight * affinity.get(slot, 0.0)
+    if not unmet:
+        return _normalize_slot_mix(baseline_mix), frozenset(), 0.0
+    total_need = sum(max(required_tags.get(t, 0), redundancy_targets.get(t, 0)) for t in unmet)
+    total_deficit = sum(max(0, max(required_tags.get(t, 0), redundancy_targets.get(t, 0)) - int(tag_counts.get(t, 0))) for t in unmet)
+    unresolved_ratio = total_deficit / max(1.0, float(total_need))
+    return _normalize_slot_mix(pressure), frozenset(unmet), max(0.0, min(1.0, unresolved_ratio))
+
+
+def _slot_pressure_adjustment(
+    card: dict,
+    contributes_unmet: bool,
+    pressure_mix: dict[str, float],
+    unresolved_ratio: float,
+) -> float:
+    kind = _card_slot_kind(card)
+    desired = float(pressure_mix.get(kind, 0.0))
+    max_desired = max(float(v) for v in pressure_mix.values())
+    gap = max(0.0, max_desired - desired)
+    if contributes_unmet:
+        # Reward cards that fill unmet tags and align with pressured slot types.
+        return (desired - (1.0 / 3.0)) * (1.2 + unresolved_ratio * 1.6)
+    # Penalize cards that don't fill deficits and also occupy low-pressure slots.
+    return -gap * (0.9 + unresolved_ratio * 2.1)
+
+
 def get_subtypes(card: dict) -> set[str]:
     """Return creature / tribal subtypes from the type line."""
     tl = card.get("type_line", "")
@@ -1293,15 +1523,16 @@ _REMOVAL_PATTERNS = re.compile(
 )
 _SWEEP_PATTERNS = re.compile(
     r"destroy all|exile all creatures|each creature gets? -\d+/"
-    r"|all creatures get -\d+|deals? \d+ damage to each creature"
-    r"|return all creatures"
+    r"|all creatures get -(?:\d+|x)|deals? \d+ damage to each creature"
+    r"|return all creatures|return all .{0,20}permanents"
 )
 _RAMP_PATTERNS = re.compile(
     r"search your library for (?:up to \w+ )?(?:a )?(?:basic )?land"
     r"|search your library for a (?:plains|island|swamp|forest|mountain)\b"
     r"|put (?:a |that )?land (?:card )?(?:from[^.]*)?onto the battlefield"
     r"|you may play an additional land|untap target land"
-    r"|adds? mana (?:of|in) (?:any|your)"  # Arcane Signet-type "add mana of any color"
+    r"|adds? mana (?:of|in) (?:any|your)"
+    r"|add (?:one|\d+|x) mana of any color"  # Arcane Signet / Birds-style templating
 )
 _DRAW_PATTERNS = re.compile(r"draw (?:a|two|three|four|\w+) cards?")
 _DISCARD_PATTERNS = re.compile(r"target player discards?|each opponent discards?")
@@ -1313,6 +1544,13 @@ _COUNTER_PATTERNS = re.compile(r"counter target (?:spell|instant|sorcery|creatur
 _THREAT_TEXT_PATTERNS = re.compile(
     r"deals? \d+ damage|target opponent|each opponent|can't block|can't attack"
     r"|draw a card|return target|destroy target|exile target|whenever .* dies"
+)
+
+_MILL_RE = re.compile(
+    rf"\bmill {_NUMBER_WORD_RE} cards?\b"
+    rf"|\bmills? cards?\b"
+    rf"|each player mills?\b",
+    re.IGNORECASE,
 )
 
 
@@ -1437,24 +1675,39 @@ def detect_synergy_tags(card: dict) -> frozenset[str]:
         oracle,
     ):
         tags.add("graveyard_payoff")
-    if re.search(
-        r"mill \d+|put the top \d+ cards? of your library into your graveyard|surveil"
-        r"|discard a card|discard one or more cards|draw .* discard"
-        r"|search your library for .* put (?:it|them) into your graveyard",
-        oracle,
+    if (
+        _MILL_RE.search(oracle)
+        or re.search(
+            r"put the top .{0,20} cards? of your library into your graveyard|surveil"
+            r"|discard a card|discard one or more cards|draw .* discard"
+            r"|search your library for .* put (?:it|them|that card) into your graveyard"
+            r"|put (?:the rest|the remainder|the others) into your graveyard"
+            r"|dredge \d+",
+            oracle,
+        )
     ):
         tags.add("graveyard_enabler")
 
     # Self-mill: specifically moves cards from your LIBRARY to graveyard.
     # Distinct from graveyard_enabler (which includes discard/loot) — Muldrotha
     # and similar commanders need library-to-graveyard specifically.
-    if re.search(
-        r"mill \d+|put the top \d+ cards? of your library into your graveyard"
-        r"|each player mills|your library into your graveyard"
-        r"|dredge \d+|whenever .{0,40} is put into a graveyard from .{0,20}library",
-        oracle,
+    if (
+        _MILL_RE.search(oracle)
+        or re.search(
+            r"put the top .{0,20} cards? of your library into your graveyard"
+            r"|your library into your graveyard"
+            r"|dredge \d+|whenever .{0,40} is put into a graveyard from .{0,20}library",
+            oracle,
+        )
     ):
         tags.add("self_mill")
+    if re.search(
+        r"exile (?:all cards from all graveyards|all graveyards|target player.s graveyard|target card from a graveyard|target cards? from (?:a|all) graveyards?)"
+        r"|cards? in graveyards can.t"
+        r"|if (?:a|an) card would be put into a graveyard, exile it instead",
+        oracle,
+    ):
+        tags.add("graveyard_hate")
 
     # Top-deck manipulation: arranges or looks at top of library.
     # Critical for commanders like Yuriko that trigger on top card damage.
@@ -1491,7 +1744,7 @@ def detect_synergy_tags(card: dict) -> frozenset[str]:
         tags.add("sacrifice")
     if re.search(r"sacrifice [^.\n]{0,40}:", oracle):
         tags.add("sac_outlet")
-    if re.search(r"when(?:ever)? .{0,30} dies", oracle):
+    if re.search(r"when(?:ever)? .{0,60} dies", oracle):
         tags.add("death_trigger")
 
     # Artifacts
@@ -1838,6 +2091,8 @@ def score_constructed_playability(card: dict) -> float:
     # --- Negative: parasitic / build-around-only ---
     if re.search(r"\bfate counter\b|\bstory circle\b|\bpayoff only if\b", oracle):
         score -= 0.5
+    if re.search(r"\bcards? with the same name\b|\bother cards? named\b", oracle):
+        score -= 1.2
     # Un-set / acorn stamp already filtered; this catches edge cases
     if re.search(r"\bacorn\b", oracle) and "acorn" not in (card.get("name") or "").lower():
         score -= 1.0
@@ -1865,7 +2120,7 @@ def score_constructed_playability(card: dict) -> float:
 # Captures the card name that follows "named".
 _NAMED_CARD_RE = re.compile(
     r'\bnamed\s+"?([A-Z][A-Za-z\' ,\-]+?)"?'
-    r'(?=\s*[,.\)]|\s+(?:is|are|that|which|you|in|on|to|from|with|when|if)\b)',
+    r'(?=\s*[,.\)]|\s+(?:is|are|that|which|you|in|on|to|from|with|when|if|and)\b)',
 )
 
 
@@ -1912,6 +2167,30 @@ SYNERGY_PAIRS: list[tuple[str, str]] = [
     ("equipment",        "voltron_payoff"),     # equipped-creature payoffs need real equipment
     ("multicolor_payoff","draw"),               # multicolor decks want fixing + card draw
     ("draw_count_payoff","draw"),               # draw-count payoffs need draw engines
+]
+
+# Higher-order support/tension interactions used by selection and fitness.
+# Fields: (signal_a, signal_b, min_a, min_b, weight)
+SUPPORT_PAIR_WEIGHTS: list[tuple[str, str, int, int, float]] = [
+    ("token_maker", "anthem", 6, 2, 1.2),
+    ("token_maker", "death_trigger", 6, 2, 1.1),
+    ("sac_outlet", "death_trigger", 3, 2, 1.3),
+    ("self_mill", "graveyard_payoff", 4, 4, 1.3),
+    ("graveyard_enabler", "graveyard_payoff", 6, 5, 1.4),
+    ("blink_enabler", "etb_trigger", 3, 8, 1.3),
+    ("spells_enabler", "spells_payoff", 12, 4, 1.25),
+    ("combat_damage_trigger", "evasion", 4, 8, 1.2),
+    ("landfall", "extra_land_drop", 5, 3, 1.2),
+    ("landfall", "land_ramp", 5, 5, 1.1),
+]
+
+TENSION_PAIR_WEIGHTS: list[tuple[str, str, int, int, float]] = [
+    ("token_maker", "sweeper", 6, 3, 1.35),
+    ("voltron_enabler", "sweeper", 5, 3, 1.1),
+    ("spells_enabler", "threat", 12, 24, 1.0),
+    ("counterspell", "threat", 8, 24, 0.9),
+    ("graveyard_payoff", "graveyard_hate", 4, 2, 1.6),
+    ("self_mill", "graveyard_hate", 4, 2, 1.5),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2031,9 +2310,9 @@ ENGINE_FLOWS: dict[str, dict] = {
     "spells_velocity": {
         "tiers": [
             # Fuel: draw cards and cantrips to keep spell count up
-            {"name": "fuel",    "tags": frozenset({"draw", "spells_enabler"}),                       "min_count": 8, "weight": 1.0},
+            {"name": "fuel",    "tags": frozenset({"draw", "spells_enabler"}),                       "min_count": 12, "weight": 1.0},
             # Engine: cost reduction + spells_enabler (instants/sorceries)
-            {"name": "engine",  "tags": frozenset({"cost_reduction", "spells_enabler"}),             "min_count": 4, "weight": 1.5},
+            {"name": "engine",  "tags": frozenset({"cost_reduction", "spells_enabler"}),             "min_count": 6, "weight": 1.5},
             # Payload: cards that reward casting spells
             {"name": "payload", "tags": frozenset({"spells_payoff"}),                                "min_count": 5, "weight": 1.3},
             # Win: wincon card or high-CMC spell bomb, or wincon role
@@ -2153,7 +2432,7 @@ ENGINE_FLOWS: dict[str, dict] = {
             # Fuel: cost-reduction effects
             {"name": "fuel",    "tags": frozenset({"cost_reduction"}),                                "min_count": 5, "weight": 1.0},
             # Engine: instants/sorceries to cast cheaply at volume
-            {"name": "engine",  "tags": frozenset({"spells_enabler", "draw"}),                       "min_count": 8, "weight": 1.5},
+            {"name": "engine",  "tags": frozenset({"spells_enabler", "draw"}),                       "min_count": 12, "weight": 1.5},
             # Payload: cards that reward the spell volume
             {"name": "payload", "tags": frozenset({"spells_payoff"}),                                 "min_count": 5, "weight": 1.3},
             # Win: wincon, or enough spells_payoff damage to close
@@ -2457,6 +2736,12 @@ LIABILITY_WEIGHTS: dict[str, float] = {
     "land_sacrifice": 3.0,
     "conditional_combat": 2.0,
     "solo_lock": 2.0,
+    "forced_sacrifice": 3.0,
+    "etb_sacrifice": 2.6,
+    "forced_discard": 2.2,
+    "lose_game": 8.0,
+    "exile_library": 6.0,
+    "self_wipe": 5.0,
 }
 
 
@@ -2466,6 +2751,44 @@ def _tag_counter_from_cards(cards: list[dict], tag_index: dict[str, frozenset[st
         for tag in tag_index.get(card["name"], frozenset()):
             counts[tag] += 1
     return counts
+
+
+def _signal_count(signal: str, tag_counts: Counter, role_counts: Counter | None = None) -> int:
+    """Read a signal count from tags first, then roles for role-only signals."""
+    if signal in tag_counts:
+        return int(tag_counts.get(signal, 0))
+    if role_counts is not None:
+        return int(role_counts.get(signal, 0))
+    return 0
+
+
+def interaction_support_tension_adjustment(
+    tag_counts: Counter,
+    role_counts: Counter | None = None,
+) -> tuple[float, float]:
+    """Return (support_bonus, tension_penalty) from cross-mechanic interactions."""
+    support_bonus = 0.0
+    tension_penalty = 0.0
+
+    for a, b, min_a, min_b, weight in SUPPORT_PAIR_WEIGHTS:
+        have_a = _signal_count(a, tag_counts, role_counts)
+        have_b = _signal_count(b, tag_counts, role_counts)
+        if have_a <= 0 or have_b <= 0:
+            continue
+        sat_a = min(1.0, have_a / max(min_a, 1))
+        sat_b = min(1.0, have_b / max(min_b, 1))
+        support_bonus += sat_a * sat_b * weight
+
+    for a, b, min_a, min_b, weight in TENSION_PAIR_WEIGHTS:
+        have_a = _signal_count(a, tag_counts, role_counts)
+        have_b = _signal_count(b, tag_counts, role_counts)
+        if have_a < min_a or have_b < min_b:
+            continue
+        tension_a = (have_a - min_a + 1) / max(min_a, 1)
+        tension_b = (have_b - min_b + 1) / max(min_b, 1)
+        tension_penalty += min(3.5, tension_a * tension_b * weight)
+
+    return support_bonus, tension_penalty
 
 
 def _narrow_mechanic_adjustment(
@@ -2547,12 +2870,28 @@ def detect_liability_flags(card: dict) -> frozenset[str]:
         flags.add("skip_turns")
     if re.search(r"at the beginning of your upkeep, sacrifice", oracle) or "cumulative upkeep" in oracle:
         flags.add("upkeep_burden")
+    if re.search(r"at the beginning of your upkeep, discard a card|during your upkeep, discard", oracle):
+        flags.add("forced_discard")
     if re.search(r"sacrifice a land", oracle):
         flags.add("land_sacrifice")
+    if re.search(r"sacrifice all (?:permanents|creatures) you control", oracle):
+        flags.add("self_wipe")
+    if re.search(r"when(?:ever)? .{0,60}(?:enters the battlefield|deals combat damage).{0,50}sacrifice", oracle):
+        flags.add("forced_sacrifice")
+    if re.search(r"when(?:ever)? .{0,30} enters.{0,40}sacrifice (?:a|an|another) ", oracle) and "you may" not in oracle:
+        flags.add("etb_sacrifice")
     if re.search(r"can't attack or block alone", oracle):
         flags.add("solo_lock")
-    if re.search(r"can't (attack|block) (or block |or attack )?unless (you.ve |you have )", oracle):
+    if re.search(
+        r"can't (attack|block) (or block |or attack )?unless "
+        r"(you.ve |you have |you control|a creature died|an? .{0,20} died)",
+        oracle,
+    ):
         flags.add("conditional_combat")
+    if re.search(r"you lose the game|lose the game", oracle):
+        flags.add("lose_game")
+    if re.search(r"exile all cards from your library|exile your library|your library becomes your graveyard", oracle):
+        flags.add("exile_library")
     return frozenset(flags)
 
 
@@ -3015,13 +3354,22 @@ def synergy_added_by_card(
     card_subtypes = get_subtypes(db.get(card_name, {}))
     score = 0.0
 
+    deck_tribe_counts: Counter = Counter()
+    for existing_name in deck_names:
+        for sub in get_subtypes(db.get(existing_name, {})):
+            deck_tribe_counts[sub] += 1
+
     for existing_name in deck_names:
         ex_tags = tag_index.get(existing_name, frozenset())
         ex_subtypes = get_subtypes(db.get(existing_name, {}))
 
         # Tribal: shared creature types
         shared_tribes = card_subtypes & ex_subtypes
-        score += len(shared_tribes) * 0.5
+        # Only reward tribe overlap when that tribe already has meaningful density.
+        # This prevents incidental shared subtypes from steering non-tribal decks.
+        for sub in shared_tribes:
+            if deck_tribe_counts.get(sub, 0) >= 5:
+                score += 0.25
 
         # Synergy pairs
         for tag_a, tag_b in SYNERGY_PAIRS:
@@ -3043,6 +3391,7 @@ def deck_synergy_total(
     deck_names: list[str],
     db: dict,
     tag_index: dict[str, frozenset[str]],
+    plan_profile: dict[str, object] | None = None,
 ) -> float:
     """Aggregate synergy score for an entire deck."""
     flat_tags: Counter = Counter()
@@ -3055,22 +3404,30 @@ def deck_synergy_total(
         for sub in get_subtypes(db.get(name, {})):
             tribe_counter[sub] += 1
 
-    tribe_score = sum(
-        math.log(max(cnt, 1)) * 0.8
-        for sub, cnt in tribe_counter.items()
-        if cnt >= 6
-    )
-
-    # Hard completeness bonuses reward deep tribal commitment the same way
-    # other engine bonuses reward completed GY/ETB loops.
-    if tribe_counter:
-        top_tribe_count = tribe_counter.most_common(1)[0][1]
-        if top_tribe_count >= 20:
-            tribe_score += 6.0
-        elif top_tribe_count >= 15:
-            tribe_score += 3.5
-        elif top_tribe_count >= 10:
-            tribe_score += 1.5
+    plans = frozenset((plan_profile or {}).get("plans", frozenset()))
+    tribal_enabled = "tribal_synergy" in plans
+    if tribal_enabled:
+        tribe_score = sum(
+            math.log(max(cnt, 1)) * 0.8
+            for _sub, cnt in tribe_counter.items()
+            if cnt >= 6
+        )
+        if tribe_counter:
+            top_tribe_count = tribe_counter.most_common(1)[0][1]
+            if top_tribe_count >= 20:
+                tribe_score += 6.0
+            elif top_tribe_count >= 15:
+                tribe_score += 3.5
+            elif top_tribe_count >= 10:
+                tribe_score += 1.5
+    else:
+        # Tiny residual signal for natural subtype concentration, but not enough
+        # to drag non-tribal decks toward low-impact tribe filler.
+        tribe_score = sum(
+            math.log(max(cnt, 1)) * 0.18
+            for _sub, cnt in tribe_counter.items()
+            if cnt >= 7
+        )
 
     pair_score = 0.0
     for tag_a, tag_b in SYNERGY_PAIRS:
@@ -3239,7 +3596,7 @@ def score_power(card: dict) -> float:
 
     # Sweepers — exclude "then destroy all X if [condition]" (secondary triggered
     # effects gated on combo conditions, e.g. Amalia Benavides Aguirre)
-    if re.search(r"destroy all|exile all creatures", oracle) and \
+    if re.search(r"destroy all|exile all creatures|all creatures get -(?:\d+|x)|return all .{0,20}permanents", oracle) and \
             not re.search(r"\bthen destroy all .{0,80}\bif\b", oracle):
         score += 1.0 if cmc <= 5 else 0.5
 
@@ -3686,6 +4043,7 @@ def select_nonlands(
     commander: dict | None = None,
     plan_profile: dict[str, object] | None = None,
     strict_tribal: bool = False,
+    ignore_tribal: bool = False,
 ) -> list[dict]:
     """
     Curve-first card selection with role weighting and synergy awareness.
@@ -3705,6 +4063,7 @@ def select_nonlands(
     required_tags: dict[str, int] = dict(plan_profile.get("required_tags", {}))
     finisher_tags: frozenset[str] = frozenset(plan_profile.get("finisher_tags", frozenset({"wincon"})))
     primary_tribe: str | None = plan_profile.get("primary_tribe")
+    active_plans: frozenset[str] = frozenset(plan_profile.get("plans", frozenset()))
     priority_profile = derive_priority_profile(plan_profile)
     core_tags: frozenset[str] = frozenset(priority_profile.get("core_tags", frozenset()))
     support_tags: frozenset[str] = frozenset(priority_profile.get("support_tags", frozenset()))
@@ -3716,7 +4075,7 @@ def select_nonlands(
         redundancy_targets[tribe_tag] = max(redundancy_targets.get(tribe_tag, 0), 30)
 
     # ── Merge user strategy with commander auto-strategy ──────────────────────
-    auto_strat = commander_auto_strategy(commander) if commander else ""
+    auto_strat = commander_auto_strategy(commander, ignore_tribal=ignore_tribal) if commander else ""
     combined_hint = f"{strategy_hint} {auto_strat}".strip()
     strategy_words = set(extract_strategy_terms(combined_hint)) if combined_hint else set()
 
@@ -3747,9 +4106,22 @@ def select_nonlands(
             or _tribe_tag in tag_index.get(c.get("name", ""), frozenset())
         ]
 
+    _pool_slot_baseline = _slot_mix_from_cards(filtered)
+    _pool_tag_slot_affinity = _build_tag_slot_affinity(filtered, tag_index, _pool_slot_baseline)
+
     package_profile = choose_active_packages(plan_profile, filtered, tag_index)
     allowed_package_tags: frozenset[str] = frozenset(package_profile.get("allowed_tags", frozenset()))
     discouraged_package_tags: frozenset[str] = frozenset(package_profile.get("discouraged_tags", frozenset()))
+    _tribal_tension = (
+        not strict_tribal
+        and primary_tribe is not None
+        and "tribal_synergy" in active_plans
+        and len(active_plans) > 1
+    )
+    _tribe_tag = f"tribe_{primary_tribe}" if primary_tribe else ""
+    _nontribal_core_tags: frozenset[str] = frozenset(
+        t for t in core_tags if not t.startswith("tribe_")
+    )
 
     # ── Strategy bonus ────────────────────────────────────────────────────────
     _strat_matchers = build_strategy_matchers(strategy_words) if strategy_words else []
@@ -3846,6 +4218,11 @@ def select_nonlands(
             struct_pen += 1.1
         if discouraged_package_tags and card_tags & discouraged_package_tags and not (card_tags & allowed_package_tags):
             struct_pen -= 1.6
+        if "graveyard_value" in active_plans and "graveyard_hate" in card_tags:
+            struct_pen -= 3.5
+        if active_plans & {"spells_velocity", "spell_cost_engine"} and is_creature(card):
+            if not (card_tags & frozenset({"spells_payoff", "cost_reduction", "draw", "treasure_maker"})):
+                struct_pen -= 1.8
 
         # (Strict tribal creature filtering is handled by hard pool exclusion
         # above — non-tribe creatures never reach composite() when enabled.)
@@ -3970,6 +4347,15 @@ def select_nonlands(
         bonus = 0.0
         card = db[card_name]
         card_roles = classify_roles(card)
+        pressure_mix, unmet_tags, unresolved_ratio = _slot_pressure_from_deficits(
+            selected_tag_counts,
+            required_tags,
+            redundancy_targets,
+            core_tags,
+            _pool_tag_slot_affinity,
+            _pool_slot_baseline,
+        )
+        contributes_unmet = bool(card_tags & unmet_tags)
         current_deck_state = {
             "subtype_counts": selected_subtype_counts,
             "type_counts": selected_type_counts,
@@ -4007,6 +4393,7 @@ def select_nonlands(
         if len(selected_names) >= max(10, nonland_slots // 2):
             if any(t in card_tags for t in finisher_tags):
                 bonus += 1.5
+        bonus += _slot_pressure_adjustment(card, contributes_unmet, pressure_mix, unresolved_ratio)
         # Synergy density: a card that touches multiple plan tags simultaneously
         # is worth more than two single-hit cards — reward multiplicative coverage.
         plan_tag_hits = len(card_tags & (core_tags | support_tags))
@@ -4037,6 +4424,59 @@ def select_nonlands(
             bonus += 0.75
         if discouraged_package_tags and card_tags & discouraged_package_tags and not (card_tags & allowed_package_tags):
             bonus -= 1.0
+        if _tribal_tension and _tribe_tag and _tribe_tag in card_tags and is_creature(card):
+            unmet_nontribal = sum(
+                max(0, redundancy_targets.get(t, 0) - selected_tag_counts.get(t, 0))
+                for t in _nontribal_core_tags
+            )
+            contributes_nontribal = bool(card_tags & _nontribal_core_tags)
+            if contributes_nontribal:
+                bonus += min(1.4, 0.30 + unmet_nontribal * 0.06)
+            elif unmet_nontribal > 0:
+                bonus -= min(3.0, 0.45 + unmet_nontribal * 0.12)
+        if active_plans & {"spells_velocity", "spell_cost_engine"}:
+            spells_need = max(
+                0,
+                redundancy_targets.get("spells_enabler", 0) - selected_tag_counts.get("spells_enabler", 0),
+            )
+            spell_creature_cap = 14 if {"spells_velocity", "spell_cost_engine"} <= active_plans else 16
+            if is_creature(card):
+                supports_spell_shell = bool(card_tags & frozenset({"spells_payoff", "cost_reduction", "draw", "treasure_maker"}))
+                creature_count = selected_type_counts.get("creature", 0)
+                if creature_count >= spell_creature_cap:
+                    over = creature_count - spell_creature_cap + 1
+                    cap_pen = 0.9 + over * 0.30
+                    if supports_spell_shell:
+                        cap_pen *= 0.55
+                    bonus -= min(5.0, cap_pen)
+                if spells_need > 0 and not supports_spell_shell:
+                    bonus -= min(3.4, 0.65 + spells_need * 0.16)
+            if spells_need > 0 and not is_creature(card) and "spells_enabler" in card_tags:
+                bonus += min(2.6, 0.45 + spells_need * 0.14)
+        if "graveyard_hate" in card_tags:
+            gy_shell = (
+                selected_tag_counts.get("graveyard_payoff", 0)
+                + selected_tag_counts.get("self_mill", 0)
+                + selected_tag_counts.get("graveyard_enabler", 0)
+            )
+            if "graveyard_value" in active_plans:
+                bonus -= 2.8
+            elif gy_shell >= 6:
+                bonus -= 1.6
+        support_before, tension_before = interaction_support_tension_adjustment(
+            selected_tag_counts, selected_role_counts
+        )
+        merged_tags = Counter(selected_tag_counts)
+        for tag in card_tags:
+            merged_tags[tag] += 1
+        merged_roles = Counter(selected_role_counts)
+        for role in set(card_roles):
+            merged_roles[role] += 1
+        support_after, tension_after = interaction_support_tension_adjustment(
+            merged_tags, merged_roles
+        )
+        bonus += (support_after - support_before) * 0.9
+        bonus -= (tension_after - tension_before) * 0.95
         if _strat_matchers:
             matched_groups = strategy_match_groups(card, _strat_matchers)
             if matched_groups:
@@ -4135,6 +4575,7 @@ def select_nonlands(
             # Patch tribal placeholder with actual tribe tag
             if _primary_plan == "tribal_synergy" and _label == "tribe_members" and primary_tribe:
                 _comp_tags = frozenset({f"tribe_{primary_tribe}"})
+                _comp_need = max(6, redundancy_targets.get(f"tribe_{primary_tribe}", _comp_need))
             if not _comp_tags:
                 continue
             _have = sum(
@@ -4306,13 +4747,15 @@ def deck_fitness(
     if commander is not None:
         deck_colors |= set(commander.get("color_identity") or [])
 
+    plan_profile = plan_profile or infer_commander_plan(commander)
+
     power_avg = sum(score_power(c) for c in cards) / max(len(cards), 1)
     arch_avg = sum(
         score_archetype_fit(c, archetype, classify_roles(c))
         for c in cards
     ) / max(len(cards), 1)
 
-    synergy = deck_synergy_total(names, db, tag_index) / max(len(cards), 1)
+    synergy = deck_synergy_total(names, db, tag_index, plan_profile=plan_profile) / max(len(cards), 1)
 
     curve_ideal = cfg["curve_targets"]
     actual_curve = Counter(min(int(get_cmc(c)), 6) for c in cards)
@@ -4370,10 +4813,12 @@ def deck_fitness(
     support_adjustment = _support_rule_adjustment(flat_tags)
     liability_cost = sum(liability_penalty(c) for c in cards) / max(len(cards), 1)
 
-    plan_profile = plan_profile or infer_commander_plan(commander)
     priority_profile = derive_priority_profile(plan_profile)
     package_profile = choose_active_packages(plan_profile, cards, tag_index)
     structure_report = evaluate_archetype_structure(cards, tag_index, archetype)
+    pair_support_bonus, pair_tension_penalty = interaction_support_tension_adjustment(
+        flat_tags, structure_report["role_counts"]
+    )
     archetype_coherence = archetype_coherence_score(cards, archetype)
     sim_land_count = land_count if land_count is not None else estimate_commander_land_count(cards, commander, archetype, plan_profile)
     sim = simulate_commander_goldfish(cards, commander, sim_land_count, tag_index, plan_profile=plan_profile)
@@ -4476,6 +4921,39 @@ def deck_fitness(
     plan_penalty += structure_report["penalty"]
     if structure_report["hard_fail"]:
         plan_penalty += 10.0
+    active_plans: frozenset[str] = frozenset(plan_profile.get("plans", frozenset()))
+    if active_plans & {"spells_velocity", "spell_cost_engine"}:
+        creature_count = sum(1 for c in cards if is_creature(c))
+        spell_creature_cap = 14 if {"spells_velocity", "spell_cost_engine"} <= active_plans else 16
+        if creature_count > spell_creature_cap:
+            plan_penalty += (creature_count - spell_creature_cap) * 0.95
+        spells_enabler_need = max(
+            required_tags.get("spells_enabler", 0),
+            redundancy_targets.get("spells_enabler", 0),
+        )
+        if spells_enabler_need > 0 and flat_tags.get("spells_enabler", 0) < spells_enabler_need:
+            plan_penalty += (spells_enabler_need - flat_tags.get("spells_enabler", 0)) * 0.42
+    if "graveyard_value" in active_plans:
+        gy_hate = flat_tags.get("graveyard_hate", 0)
+        if gy_hate > 0:
+            plan_penalty += gy_hate * 1.4
+    slot_baseline = _slot_mix_from_cards(cards)
+    tag_slot_affinity = _build_tag_slot_affinity(cards, tag_index, slot_baseline)
+    desired_slot_mix, _unmet_tags, unresolved_ratio = _slot_pressure_from_deficits(
+        flat_tags,
+        required_tags,
+        redundancy_targets,
+        core_tags,
+        tag_slot_affinity,
+        slot_baseline,
+    )
+    actual_slot_mix = slot_baseline
+    slot_mismatch = 0.5 * sum(
+        abs(actual_slot_mix.get(slot, 0.0) - desired_slot_mix.get(slot, 0.0))
+        for slot in _SLOT_TYPES
+    )
+    if unresolved_ratio > 0:
+        plan_penalty += slot_mismatch * (1.0 + unresolved_ratio * 2.4)
 
     # Engine flow score: reward decks whose fuel→engine→payload→win chain is complete.
     # A deck missing a critical tier (< 50% satisfied) loses up to 3.5 pts.
@@ -4503,6 +4981,7 @@ def deck_fitness(
             + narrow_adjustment
             + support_adjustment
             + redundancy_bonus
+            + pair_support_bonus
             + archetype_coherence * 1.8
             + engine_flow_score
             + win_con_score
@@ -4511,6 +4990,7 @@ def deck_fitness(
             - liability_cost
             - requirement_penalty
             - redundancy_penalty
+            - pair_tension_penalty
             - plan_penalty
         )
     return (
@@ -4524,6 +5004,7 @@ def deck_fitness(
         + narrow_adjustment
         + support_adjustment
         + redundancy_bonus
+        + pair_support_bonus
         + archetype_coherence * 1.8
         + engine_flow_score
         + win_con_score
@@ -4532,6 +5013,7 @@ def deck_fitness(
         - liability_cost
         - requirement_penalty
         - redundancy_penalty
+        - pair_tension_penalty
         - plan_penalty
     )
 
@@ -4554,6 +5036,10 @@ def evolutionary_refine(
     """Mutation-based evolutionary refinement with limited exploratory moves."""
     current = list(nonlands)
     plan_profile = plan_profile or infer_commander_plan(commander)
+    priority_profile = derive_priority_profile(plan_profile)
+    required_tags: dict[str, int] = dict(plan_profile.get("required_tags", {}))
+    redundancy_targets: dict[str, int] = dict(priority_profile.get("redundancy_targets", {}))
+    core_tags: frozenset[str] = frozenset(priority_profile.get("core_tags", frozenset()))
     current_fitness = deck_fitness(
         current, db, tag_index, archetype, strategy_words,
         commander=commander, land_count=land_count, plan_profile=plan_profile,
@@ -4579,6 +5065,9 @@ def evolutionary_refine(
             if "Creature" not in (c.get("type_line") or "")
             or _evo_tribe_tag in tag_index.get(c.get("name", ""), frozenset())
         ]
+
+    _evo_slot_baseline = _slot_mix_from_cards(eligible_pool)
+    _evo_tag_slot_affinity = _build_tag_slot_affinity(eligible_pool, tag_index, _evo_slot_baseline)
 
     candidates = [c for c in eligible_pool if c["name"] not in current_names]
 
@@ -4621,6 +5110,7 @@ def evolutionary_refine(
         strategy_counts: Counter,
     ) -> float:
         bonus = 0.0
+        card_tags = tag_index.get(c.get("name", ""), frozenset())
         roles = classify_roles(c)
         arch_fit = score_archetype_fit(c, archetype, roles)
         arch_blend = archetype_blend_multiplier(
@@ -4631,6 +5121,20 @@ def evolutionary_refine(
             len(current),
         )
         bonus += arch_fit * 3.0 * (arch_blend - 1.0)
+        pressure_mix, unmet_tags, unresolved_ratio = _slot_pressure_from_deficits(
+            deck_state["tag_counts"],
+            required_tags,
+            redundancy_targets,
+            core_tags,
+            _evo_tag_slot_affinity,
+            _evo_slot_baseline,
+        )
+        bonus += _slot_pressure_adjustment(
+            c,
+            bool(card_tags & unmet_tags),
+            pressure_mix,
+            unresolved_ratio,
+        )
         if _evo_matchers:
             matched_groups = strategy_match_groups(c, _evo_matchers)
             if matched_groups:
@@ -4767,6 +5271,36 @@ def deck_shape_signature(cards: list[dict], tag_index: dict[str, frozenset[str]]
     )
 
 
+def compute_synergy_rating(
+    nonlands: list[dict],
+    db: dict,
+    tag_index: dict[str, frozenset[str]],
+    plan_profile: dict[str, object] | None = None,
+) -> tuple[int, float]:
+    """
+    Return (display_score_0_100, raw_per_card_synergy).
+    Uses deck-level synergy total and adds a small tribal focus bonus only when
+    tribal_synergy is an active inferred plan.
+    """
+    names = [c.get("name", "") for c in nonlands if c.get("name")]
+    if not names:
+        return 0, 0.0
+    synergy_total = deck_synergy_total(names, db, tag_index, plan_profile=plan_profile)
+    per_card = synergy_total / max(len(nonlands), 1)
+    plans = frozenset((plan_profile or {}).get("plans", frozenset()))
+    tribal_bonus = 0.0
+    if "tribal_synergy" in plans:
+        tribe_counter: Counter = Counter()
+        for card in nonlands:
+            for sub in get_subtypes(card):
+                tribe_counter[sub] += 1
+        top_tribe = tribe_counter.most_common(1)[0][1] if tribe_counter else 0
+        if top_tribe >= 8:
+            tribal_bonus = min(20.0, (top_tribe - 8) * 1.5)
+    display = int(max(0, min(100, round(per_card * 60.0 + tribal_bonus))))
+    return display, per_card
+
+
 def generate_commander_candidates(
     all_nonlands: list[dict],
     db: dict,
@@ -4782,6 +5316,7 @@ def generate_commander_candidates(
     plan_profile: dict[str, object],
     num_candidates: int = 6,
     strict_tribal: bool = False,
+    ignore_tribal: bool = False,
 ) -> tuple[list[dict], int]:
     """
     Generate multiple candidate decks and keep the best deck per shape bucket.
@@ -4791,7 +5326,7 @@ def generate_commander_candidates(
     max_cmc = ARCHETYPE_CONFIG[archetype].get("max_cmc", 99)
     strat_words = list({
         *extract_strategy_terms(strategy_hint),
-        *extract_strategy_terms(commander_auto_strategy(commander)),
+        *extract_strategy_terms(commander_auto_strategy(commander, ignore_tribal=ignore_tribal)),
     } - {""})
 
     for idx in range(max(1, num_candidates)):
@@ -4803,6 +5338,7 @@ def generate_commander_candidates(
             commander=commander,
             plan_profile=plan_profile,
             strict_tribal=strict_tribal,
+            ignore_tribal=ignore_tribal,
         )
         land_count = estimate_commander_land_count(seed_nonlands, commander, archetype, plan_profile)
         nonland_slots = COMMANDER_MAIN_SIZE - land_count
@@ -4813,6 +5349,7 @@ def generate_commander_candidates(
             commander=commander,
             plan_profile=plan_profile,
             strict_tribal=strict_tribal,
+            ignore_tribal=ignore_tribal,
         )
         if not no_evolve:
             candidate = evolutionary_refine(
@@ -5357,6 +5894,8 @@ def main() -> None:
                         help="Deck archetype (default: midrange)")
     parser.add_argument("--strategy", default="",
                         help="Additional strategy keyword(s); auto-detected from commander")
+    parser.add_argument("--ignore-tribal", action="store_true",
+                        help="Disable automatic tribal inference from commander subtypes")
     parser.add_argument("--max-rarity", default="mythic",
                         choices=["common", "uncommon", "rare", "mythic"],
                         help="Highest allowed rarity (default: mythic)")
@@ -5409,8 +5948,10 @@ def main() -> None:
 
     colors = get_color_identity(commander)
     print(f"Commander: {commander['name']}  [{' '.join(sorted(colors))}]", file=sys.stderr)
-    auto = commander_auto_strategy(commander)
+    auto = commander_auto_strategy(commander, ignore_tribal=args.ignore_tribal)
     plan_profile = infer_commander_plan(commander)
+    if args.ignore_tribal:
+        plan_profile = remove_tribal_plan_bias(plan_profile)
     if auto:
         print(f"  Auto-strategy: {auto}", file=sys.stderr)
     if plan_profile.get("plans"):
@@ -5464,6 +6005,7 @@ def main() -> None:
         no_evolve=args.no_evolve,
         plan_profile=plan_profile,
         num_candidates=args.candidate_decks,
+        ignore_tribal=args.ignore_tribal,
     )
     nonland_slots = COMMANDER_MAIN_SIZE - land_count
     print(f"Selected candidate with {land_count} lands from quality-diversity archive...", file=sys.stderr)
@@ -5537,6 +6079,9 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
     candidate_decks = params.get("candidate_decks", 6)
     strict_tribal = params.get("strict_tribal", False)
     strict_tribal_type: str | None = params.get("strict_tribal_type") or None
+    ignore_tribal = params.get("ignore_tribal", False)
+    if strict_tribal:
+        ignore_tribal = False
 
     if seed is not None:
         random.seed(seed)
@@ -5559,8 +6104,10 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
         raise ValueError(f"Commander '{commander_name}' not found in database.")
 
     colors = get_color_identity(commander) or {"C"}
-    auto = commander_auto_strategy(commander)
+    auto = commander_auto_strategy(commander, ignore_tribal=ignore_tribal)
     plan_profile = infer_commander_plan(commander)
+    if ignore_tribal:
+        plan_profile = remove_tribal_plan_bias(plan_profile)
 
     # If the user specified a tribe override, inject it into the plan profile
     # so all downstream scoring treats it as the primary tribe.
@@ -5607,7 +6154,9 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
             strat, nonland_slots, rarity,
             diversity=diversity,
             commander=commander,
+            plan_profile=plan_profile,
             strict_tribal=strict_tribal,
+            ignore_tribal=ignore_tribal,
         )
         strat_words = list({
             *extract_strategy_terms(strat),
@@ -5637,6 +6186,7 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
             plan_profile=plan_profile,
             num_candidates=candidate_decks,
             strict_tribal=strict_tribal,
+            ignore_tribal=ignore_tribal,
         )
 
     _p("Building mana base…", 85)
@@ -5666,6 +6216,9 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
     for card in selected_nonlands:
         for sub in get_subtypes(card):
             tribe_counter[sub] += 1
+    synergy_score, synergy_per_card = compute_synergy_rating(
+        selected_nonlands, db, tag_index, plan_profile=plan_profile
+    )
 
     return {
         "mode": "commander",
@@ -5681,6 +6234,8 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
             if is_reportable_synergy(t, c, flat_tags)
         ],
         "tribes": [[t, c] for t, c in tribe_counter.most_common(8) if c >= 3],
+        "synergy_score": synergy_score,
+        "synergy_per_card": synergy_per_card,
         "avg_cmc": sum(get_cmc(c) for c in selected_nonlands) / max(len(selected_nonlands), 1),
         "avg_power": sum(score_power(c) for c in selected_nonlands) / max(len(selected_nonlands), 1),
         "deck_text": format_commander(commander, selected_nonlands, selected_lands),
