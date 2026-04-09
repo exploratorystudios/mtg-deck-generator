@@ -20,12 +20,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 import os
 import random
 import re
 import sys
+import time
+import urllib.error
+import urllib.request
 from collections import Counter, defaultdict
 
 from deck_requirements import (
@@ -37,9 +41,14 @@ from deck_requirements import (
 )
 
 CARDS_DIR = os.path.join(os.path.dirname(__file__), "cards", "commander")
+EDHREC_CACHE_DIR = os.path.join(CARDS_DIR, ".cache", "edhrec")
+EDHREC_CACHE_TTL_SEC = 60 * 60 * 24 * 7  # 7 days
+EDHREC_ARCHIVE_JSON = os.path.join(EDHREC_CACHE_DIR, "edhrec_commander_suite_v1.json")
+EDHREC_ARCHIVE_GZ = os.path.join(EDHREC_CACHE_DIR, "edhrec_commander_suite_v1.json.gz")
 COMMANDER_DECK_SIZE = 100   # total including commander
 COMMANDER_MAIN_SIZE = 99    # cards in the 99 (not commander)
 _GOLDFISH_CACHE: dict[tuple, dict[str, float]] = {}
+_EDHREC_ARCHIVE_MEM: dict[str, object] | None = None
 _NUMBER_WORD_RE = r"(?:\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|x|\w+)"
 _ETB_RE = r"enters(?: the battlefield)?"
 _LTB_RE = r"leaves(?: the battlefield)?"
@@ -233,6 +242,237 @@ ARCHETYPE_CONFIG = {
         },
     },
 }
+
+
+def _edhrec_slug(name: str) -> str:
+    slug = (name or "").lower().strip()
+    slug = slug.replace("&", " and ")
+    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
+    slug = re.sub(r"\s+", "-", slug).strip("-")
+    return slug
+
+
+def _edhrec_slug_candidates(name: str) -> list[str]:
+    """
+    Generate fallback slug variants for commanders whose canonical EDHREC page
+    uses an unexpected normalization.
+    """
+    base = _edhrec_slug(name)
+    out: list[str] = [base] if base else []
+
+    raw = (name or "").strip()
+    if not raw:
+        return out
+
+    # Strip subtitle after comma: "Alela, Cunning Conqueror" -> "Alela"
+    if "," in raw:
+        head = _edhrec_slug(raw.split(",", 1)[0])
+        if head:
+            out.append(head)
+
+    # Alternate handling of '&' and 'and'
+    amp = re.sub(r"&", " ", raw)
+    amp_slug = _edhrec_slug(amp)
+    if amp_slug:
+        out.append(amp_slug)
+    and_slug = _edhrec_slug(raw.replace("&", " and "))
+    if and_slug:
+        out.append(and_slug)
+
+    # Remove punctuation artifacts and duplicate dashes
+    simple = re.sub(r"[^A-Za-z0-9\s]", " ", raw)
+    simple_slug = _edhrec_slug(simple)
+    if simple_slug:
+        out.append(simple_slug)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for s in out:
+        if s and s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
+
+
+def _edhrec_cache_path(commander_name: str) -> str:
+    return os.path.join(EDHREC_CACHE_DIR, f"{_edhrec_slug(commander_name)}.json")
+
+
+def _extract_edhrec_card_names(payload: object) -> list[str]:
+    names: list[str] = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            name = node.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
+def _load_edhrec_archive_index() -> dict[str, list[str]]:
+    """
+    Load prebuilt commander→card-list EDHREC archive (json or json.gz).
+    Returns mapping keyed by commander slug.
+    """
+    global _EDHREC_ARCHIVE_MEM
+    if isinstance(_EDHREC_ARCHIVE_MEM, dict):
+        suites = _EDHREC_ARCHIVE_MEM.get("suites")
+        if isinstance(suites, dict):
+            return {
+                str(k): [str(x) for x in v if isinstance(x, str)]
+                for k, v in suites.items()
+                if isinstance(v, list)
+            }
+        return {}
+
+    payload: dict[str, object] | None = None
+    try:
+        if os.path.exists(EDHREC_ARCHIVE_GZ):
+            with gzip.open(EDHREC_ARCHIVE_GZ, "rt", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                payload = data
+        elif os.path.exists(EDHREC_ARCHIVE_JSON):
+            with open(EDHREC_ARCHIVE_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                payload = data
+    except Exception:
+        payload = None
+
+    _EDHREC_ARCHIVE_MEM = payload or {}
+    suites = _EDHREC_ARCHIVE_MEM.get("suites", {})
+    if not isinstance(suites, dict):
+        return {}
+    return {
+        str(k): [str(x) for x in v if isinstance(x, str)]
+        for k, v in suites.items()
+        if isinstance(v, list)
+    }
+
+
+def load_edhrec_prior(
+    commander_name: str,
+    *,
+    allow_live_fetch: bool = True,
+    ttl_sec: int = EDHREC_CACHE_TTL_SEC,
+    max_cards: int = 400,
+    timeout_sec: float = 6.0,
+) -> dict[str, float]:
+    """
+    Load commander-level EDHREC prior as {card_name: rank_score[0..1]}.
+    Uses local cache first; if stale/missing and live fetch fails, returns stale
+    cache if available, otherwise {}.
+    """
+    if not commander_name:
+        return {}
+
+    os.makedirs(EDHREC_CACHE_DIR, exist_ok=True)
+    cache_path = _edhrec_cache_path(commander_name)
+    now = int(time.time())
+    slug = _edhrec_slug(commander_name)
+    slug_candidates = _edhrec_slug_candidates(commander_name)
+
+    def parse_cached(raw: dict) -> dict[str, float]:
+        cards = raw.get("cards", [])
+        if not isinstance(cards, list):
+            return {}
+        out: dict[str, float] = {}
+        n = max(1, len(cards))
+        for i, name in enumerate(cards[:max_cards]):
+            if not isinstance(name, str) or not name:
+                continue
+            out[name] = max(0.0, 1.0 - (i / n))
+        return out
+
+    cached_raw: dict | None = None
+    cache_is_fresh = False
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached_raw = json.load(f)
+            fetched_at = int(cached_raw.get("fetched_at", 0)) if isinstance(cached_raw, dict) else 0
+            cache_is_fresh = bool(fetched_at and (now - fetched_at) <= max(60, int(ttl_sec)))
+        except Exception:
+            cached_raw = None
+            cache_is_fresh = False
+
+    if cache_is_fresh and isinstance(cached_raw, dict):
+        parsed = parse_cached(cached_raw)
+        if parsed:
+            return parsed
+
+    # Archive-first fallback: if a prebuilt suite exists for this commander,
+    # prefer it over network fetch for deterministic and offline generation.
+    archive = _load_edhrec_archive_index()
+    archive_cards = None
+    for s in slug_candidates:
+        archive_cards = archive.get(s)
+        if archive_cards:
+            break
+    if archive_cards:
+        safe = {
+            "commander": commander_name,
+            "fetched_at": now,
+            "cards": archive_cards[:max_cards],
+            "source": "archive",
+        }
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(safe, f, ensure_ascii=True)
+        except Exception:
+            pass
+        parsed = parse_cached(safe)
+        if parsed:
+            return parsed
+
+    if allow_live_fetch:
+        for s in slug_candidates:
+            url = f"https://json.edhrec.com/pages/commanders/{s}.json"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "mtg-deck-generator/1.0"})
+                with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                names = _extract_edhrec_card_names(payload)
+                if names:
+                    names = names[:max_cards]
+                    safe = {
+                        "commander": commander_name,
+                        "fetched_at": now,
+                        "cards": names,
+                        "source": url,
+                    }
+                    try:
+                        with open(cache_path, "w", encoding="utf-8") as f:
+                            json.dump(safe, f, ensure_ascii=True)
+                    except Exception:
+                        pass
+                    return parse_cached(safe)
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
+                continue
+            except Exception:
+                continue
+
+    # Fallback: stale cache if available
+    if isinstance(cached_raw, dict):
+        parsed = parse_cached(cached_raw)
+        if parsed:
+            return parsed
+    return {}
 
 # Role clusters used to turn archetype fit into a deck-aware signal.
 # Cards should score better when they reinforce the role pattern the deck is
@@ -4486,6 +4726,8 @@ def select_nonlands(
     plan_profile: dict[str, object] | None = None,
     strict_tribal: bool = False,
     ignore_tribal: bool = False,
+    edhrec_prior: dict[str, float] | None = None,
+    edhrec_influence: float = 0.0,
 ) -> list[dict]:
     """
     Curve-first card selection with role weighting and synergy awareness.
@@ -4583,6 +4825,8 @@ def select_nonlands(
     _nontribal_plan_tags: frozenset[str] = (
         _nontribal_core_tags | _nontribal_support_tags | _nontribal_finisher_tags
     )
+    _edhrec_prior = dict(edhrec_prior or {})
+    _edhrec_influence = max(0.0, min(1.0, float(edhrec_influence)))
 
     # ── Strategy bonus ────────────────────────────────────────────────────────
     _strat_matchers = build_strategy_matchers(strategy_words) if strategy_words else []
@@ -4716,6 +4960,10 @@ def select_nonlands(
                 struct_pen += 0.9
             elif get_cmc(card) >= 5 and "wincon" not in roles and "draw" not in roles and "tutor" not in roles:
                 struct_pen -= 0.6
+        if _edhrec_influence > 0.0:
+            prior = _edhrec_prior.get(card.get("name", ""), None)
+            if prior is not None:
+                struct_pen += _edhrec_influence * (float(prior) * 2.2)
 
         # Change 3: quality gate — low-power cards get diminished strategy bonus
         # so a keyword match on a bad card can't drag it into the deck.
@@ -4936,6 +5184,10 @@ def select_nonlands(
             # Combo archetypes should avoid random orphan pieces that don't
             # improve any active template.
             bonus -= 1.2
+        if _edhrec_influence > 0.0:
+            prior = _edhrec_prior.get(card_name, None)
+            if prior is not None:
+                bonus += _edhrec_influence * ((float(prior) - 0.5) * 1.4)
         bonus += _slot_pressure_adjustment(card, contributes_unmet, pressure_mix, unresolved_ratio)
         # Synergy density: a card that touches multiple plan tags simultaneously
         # is worth more than two single-hit cards — reward multiplicative coverage.
@@ -6100,6 +6352,8 @@ def generate_commander_candidates(
     num_candidates: int = 6,
     strict_tribal: bool = False,
     ignore_tribal: bool = False,
+    edhrec_prior: dict[str, float] | None = None,
+    edhrec_influence: float = 0.0,
 ) -> tuple[list[dict], int]:
     """
     Generate multiple candidate decks and keep the best deck per shape bucket.
@@ -6122,6 +6376,8 @@ def generate_commander_candidates(
             plan_profile=plan_profile,
             strict_tribal=strict_tribal,
             ignore_tribal=ignore_tribal,
+            edhrec_prior=edhrec_prior,
+            edhrec_influence=edhrec_influence,
         )
         land_count = estimate_commander_land_count(seed_nonlands, commander, archetype, plan_profile)
         nonland_slots = COMMANDER_MAIN_SIZE - land_count
@@ -6133,6 +6389,8 @@ def generate_commander_candidates(
             plan_profile=plan_profile,
             strict_tribal=strict_tribal,
             ignore_tribal=ignore_tribal,
+            edhrec_prior=edhrec_prior,
+            edhrec_influence=edhrec_influence,
         )
         if not no_evolve:
             candidate = evolutionary_refine(
@@ -6722,6 +6980,10 @@ def main() -> None:
                         help="Diversity/noise level 0.0–3.0 (default: 1.0)")
     parser.add_argument("--candidate-decks", type=int, default=6,
                         help="Number of candidate deck shapes to explore before selecting the best (default: 6)")
+    parser.add_argument("--edhrec-influence", type=float, default=0.18,
+                        help="EDHREC prior influence 0.0–1.0 (default: 0.18)")
+    parser.add_argument("--no-edhrec-live", action="store_true",
+                        help="Disable live EDHREC fetch; use cache/fallback only")
 
     args = parser.parse_args()
 
@@ -6769,6 +7031,10 @@ def main() -> None:
 
     if args.seed is not None:
         random.seed(args.seed)
+    edhrec_prior = load_edhrec_prior(
+        commander.get("name", ""),
+        allow_live_fetch=(not args.no_edhrec_live),
+    )
 
     archetype  = args.archetype
     cfg        = ARCHETYPE_CONFIG[archetype]
@@ -6816,6 +7082,8 @@ def main() -> None:
         plan_profile=plan_profile,
         num_candidates=args.candidate_decks,
         ignore_tribal=args.ignore_tribal,
+        edhrec_prior=edhrec_prior,
+        edhrec_influence=args.edhrec_influence,
     )
     nonland_slots = COMMANDER_MAIN_SIZE - land_count
     print(f"Selected candidate with {land_count} lands from quality-diversity archive...", file=sys.stderr)
@@ -6884,6 +7152,8 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
     diversity = params.get("diversity", 1.0)
     commander_name = params["commander_name"]
     candidate_decks = params.get("candidate_decks", 6)
+    edhrec_influence = float(params.get("edhrec_influence", 0.18))
+    edhrec_live = bool(params.get("edhrec_live", True))
     strict_tribal = params.get("strict_tribal", False)
     strict_tribal_type: str | None = params.get("strict_tribal_type") or None
     ignore_tribal = params.get("ignore_tribal", False)
@@ -6916,6 +7186,10 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
     if ignore_tribal:
         plan_profile = remove_tribal_plan_bias(plan_profile)
     plan_profile = apply_strategy_tribal_mode(plan_profile, strat)
+    edhrec_prior = load_edhrec_prior(
+        commander.get("name", ""),
+        allow_live_fetch=edhrec_live,
+    )
 
     # If the user specified a tribe override, inject it into the plan profile
     # so all downstream scoring treats it as the primary tribe.
@@ -6965,6 +7239,8 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
             plan_profile=plan_profile,
             strict_tribal=strict_tribal,
             ignore_tribal=ignore_tribal,
+            edhrec_prior=edhrec_prior,
+            edhrec_influence=edhrec_influence,
         )
         strat_words = list({
             *extract_strategy_terms(strat),
@@ -6995,6 +7271,8 @@ def generate_deck(params: dict, progress_cb=None) -> dict:
             num_candidates=candidate_decks,
             strict_tribal=strict_tribal,
             ignore_tribal=ignore_tribal,
+            edhrec_prior=edhrec_prior,
+            edhrec_influence=edhrec_influence,
         )
 
     _p("Building mana base…", 85)

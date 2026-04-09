@@ -3042,6 +3042,8 @@ class BrawlGeneratorWorker(QThread):
             no_evo         = p["no_evolve"]
             gens           = p["generations"]
             diversity      = p.get("diversity", 0.0)
+            edhrec_influence = float(p.get("edhrec_influence", 0.18))
+            edhrec_live    = bool(p.get("edhrec_live", True))
             commander_name = p["commander_name"]
             strict_tribal  = p.get("strict_tribal", False)
             strict_tribal_type = p.get("strict_tribal_type") or None
@@ -3205,6 +3207,8 @@ class CommanderGeneratorWorker(QThread):
             no_evo         = p["no_evolve"]
             gens           = p["generations"]
             diversity      = p.get("diversity", 0.0)
+            edhrec_influence = float(p.get("edhrec_influence", 0.18))
+            edhrec_live    = bool(p.get("edhrec_live", True))
             commander_name = p["commander_name"]
             strict_tribal  = p.get("strict_tribal", False)
             strict_tribal_type = p.get("strict_tribal_type") or None
@@ -3236,6 +3240,10 @@ class CommanderGeneratorWorker(QThread):
             colors = dgc.get_color_identity(commander) or {"C"}
             auto = dgc.commander_auto_strategy(commander, ignore_tribal=ignore_tribal)
             plan_profile = dgc.infer_commander_plan(commander)
+            edhrec_prior = dgc.load_edhrec_prior(
+                commander.get("name", ""),
+                allow_live_fetch=edhrec_live,
+            )
             if ignore_tribal:
                 plan_profile = dgc.remove_tribal_plan_bias(plan_profile)
             if strict_tribal and strict_tribal_type:
@@ -3280,6 +3288,8 @@ class CommanderGeneratorWorker(QThread):
                 plan_profile=plan_profile,
                 strict_tribal=strict_tribal,
                 ignore_tribal=ignore_tribal,
+                edhrec_prior=edhrec_prior,
+                edhrec_influence=edhrec_influence,
             )
 
             if not no_evo:
@@ -3852,6 +3862,8 @@ class LeftPanel(QWidget):
             "generations":    gens,
             "diversity":      diversity,
             "candidate_decks": candidate_decks,
+            "edhrec_influence": 0.18,
+            "edhrec_live": True,
             "strict_tribal":       self.strict_tribal_check.isChecked(),
             "strict_tribal_type":  self.strict_tribal_edit.text().strip().lower() or None,
             "ignore_tribal":       self.ignore_tribal_check.isChecked(),

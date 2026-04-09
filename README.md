@@ -37,6 +37,21 @@ From the repo root:
 python3 mtg_gui.py
 ```
 
+## EDHREC Suite Archive
+
+To prefetch EDHREC suites for all commanders in your local database and build a reusable archive:
+
+```bash
+python3 scripts/prefetch_edhrec_suite.py
+```
+
+This writes:
+
+- `cards/commander/.cache/edhrec/edhrec_commander_suite_v1.json`
+- `cards/commander/.cache/edhrec/edhrec_commander_suite_v1.json.gz`
+
+The generator will read this archive first, then fall back to per-commander cache, then optional live fetch.
+
 ## Notes
 
 - The app is built for Commander / EDH only.
