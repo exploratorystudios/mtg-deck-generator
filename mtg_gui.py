@@ -2876,6 +2876,7 @@ class GeneratorWorker(QThread):
             colors  = p["colors"]
             arch      = p["archetype"]
             strat     = p["strategy"]
+            neg_strat = p.get("negative_strategy", "")
             rarity    = p["max_rarity"]
             seed      = p["seed"]
             no_evo    = p["no_evolve"]
@@ -2916,21 +2917,36 @@ class GeneratorWorker(QThread):
             self.signals.progress.emit(
                 f"Selecting nonland cards ({nonland_slots} slots)…", 30
             )
+            # Filter negative words from positive strategy to avoid conflicting boosts
+            filtered_strat = strat
+            if neg_strat:
+                neg_terms = set(dg.extract_strategy_terms(neg_strat))
+                pos_terms = dg.extract_strategy_terms(strat)
+                filtered_terms = [t for t in pos_terms if t not in neg_terms]
+                filtered_strat = " ".join(filtered_terms)
+
             selected_nonlands = dg.select_nonlands(
                 all_nonlands, db, tag_index, arch, colors,
-                strat, nonland_slots, rarity,
+                filtered_strat, nonland_slots, rarity,
                 diversity=diversity,
+                negative_hint=neg_strat,
             )
 
             if not no_evo:
                 self.signals.progress.emit(
                     f"Evolving deck ({gens} generations)…", 55
                 )
+                strat_words = [w for w in strat.lower().split() if w]
+                neg_words = [w for w in neg_strat.lower().split() if w] if neg_strat else None
+                # Remove negative words from positive strategy to avoid conflicting boosts
+                if neg_words:
+                    strat_words = [w for w in strat_words if w not in neg_words]
                 selected_nonlands = dg.evolutionary_refine(
                     selected_nonlands, all_nonlands, db, tag_index, arch, gens,
                     max_cmc=cfg.get("max_cmc", 99),
-                    strategy_words=[w for w in strat.lower().split() if w],
+                    strategy_words=strat_words,
                     diversity=diversity,
+                    negative_words=neg_words,
                 )
 
             self.signals.progress.emit("Building mana base…", 85)
@@ -3037,6 +3053,7 @@ class BrawlGeneratorWorker(QThread):
             p = self.params
             arch           = p["archetype"]
             strat          = p["strategy"]
+            neg_strat      = p.get("negative_strategy", "")
             rarity         = p["max_rarity"]
             seed           = p["seed"]
             no_evo         = p["no_evolve"]
@@ -3100,19 +3117,26 @@ class BrawlGeneratorWorker(QThread):
                 strat, nonland_slots, rarity,
                 diversity=diversity,
                 commander=commander,
+                negative_hint=neg_strat,
             )
 
             if not no_evo:
                 self.signals.progress.emit(
                     f"Evolving deck ({gens} generations)…", 55
                 )
+                strat_words = [w for w in strat.lower().split() if w]
+                neg_words = [w for w in neg_strat.lower().split() if w] if neg_strat else None
+                # Remove negative words from positive strategy to avoid conflicting boosts
+                if neg_words:
+                    strat_words = [w for w in strat_words if w not in neg_words]
                 selected_nonlands = dgb.evolutionary_refine(
                     selected_nonlands, all_nonlands, db, tag_index, arch, gens,
                     max_cmc=cfg.get("max_cmc", 99),
-                    strategy_words=[w for w in strat.lower().split() if w],
+                    strategy_words=strat_words,
                     diversity=diversity,
                     commander=commander,
                     land_count=land_count,
+                    negative_words=neg_words,
                 )
 
             self.signals.progress.emit("Building mana base…", 85)
@@ -3202,6 +3226,7 @@ class CommanderGeneratorWorker(QThread):
             p = self.params
             arch           = p["archetype"]
             strat          = p["strategy"]
+            neg_strat      = p.get("negative_strategy", "")
             rarity         = p["max_rarity"]
             seed           = p["seed"]
             no_evo         = p["no_evolve"]
@@ -3246,6 +3271,24 @@ class CommanderGeneratorWorker(QThread):
             )
             if ignore_tribal:
                 plan_profile = dgc.remove_tribal_plan_bias(plan_profile)
+            if neg_strat:
+                # Strip all plan-profile pressure that conflicts with negative bias.
+                # derive_priority_profile() reads from static PLAN_PRIORITY_RULES keyed
+                # by plan name, so we must remove conflicting plans from the frozenset
+                # to prevent redundancy_targets from being re-injected downstream.
+                _neg_terms = set(dgc.extract_strategy_terms(neg_strat))
+                _req = {k: v for k, v in plan_profile.get("required_tags", {}).items()
+                        if not any(_t in k for _t in _neg_terms)}
+                _red = {k: v for k, v in plan_profile.get("redundancy_targets", {}).items()
+                        if not any(_t in k for _t in _neg_terms)}
+                _plans = frozenset(
+                    p for p in plan_profile.get("plans", frozenset())
+                    if not any(_t in p for _t in _neg_terms)
+                )
+                plan_profile = {**plan_profile,
+                                "required_tags": _req,
+                                "redundancy_targets": _red,
+                                "plans": _plans}
             if strict_tribal and strict_tribal_type:
                 plan_profile = dict(plan_profile)
                 plan_profile["primary_tribe"] = strict_tribal_type
@@ -3280,9 +3323,17 @@ class CommanderGeneratorWorker(QThread):
             self.signals.progress.emit(
                 f"Selecting nonland cards ({nonland_slots} slots)…", 30
             )
+            # Filter negative words from positive strategy to avoid conflicting boosts
+            filtered_strat = strat
+            if neg_strat:
+                neg_terms = set(dgc.extract_strategy_terms(neg_strat))
+                pos_terms = dgc.extract_strategy_terms(strat)
+                filtered_terms = [t for t in pos_terms if t not in neg_terms]
+                filtered_strat = " ".join(filtered_terms)
+
             selected_nonlands = dgc.select_nonlands(
                 all_nonlands, db, tag_index, arch, colors,
-                strat, nonland_slots, rarity,
+                filtered_strat, nonland_slots, rarity,
                 diversity=diversity,
                 commander=commander,
                 plan_profile=plan_profile,
@@ -3290,24 +3341,31 @@ class CommanderGeneratorWorker(QThread):
                 ignore_tribal=ignore_tribal,
                 edhrec_prior=edhrec_prior,
                 edhrec_influence=edhrec_influence,
+                negative_hint=neg_strat,
             )
 
             if not no_evo:
                 self.signals.progress.emit(
                     f"Evolving deck ({gens} generations)…", 55
                 )
+                neg_words = list(dgc.extract_strategy_terms(neg_strat)) if neg_strat else None
+                # Subtract negative words from combined strategy to prevent auto-strategy boosting them
+                combined_strat_words = {
+                    *dgc.extract_strategy_terms(strat),
+                    *dgc.extract_strategy_terms(auto),
+                } - {""}
+                if neg_words:
+                    combined_strat_words -= set(neg_words)
                 selected_nonlands = dgc.evolutionary_refine(
                     selected_nonlands, all_nonlands, db, tag_index, arch, gens,
                     max_cmc=cfg.get("max_cmc", 99),
-                    strategy_words=list({
-                        *dgc.extract_strategy_terms(strat),
-                        *dgc.extract_strategy_terms(auto),
-                    } - {""}),
+                    strategy_words=list(combined_strat_words),
                     diversity=diversity,
                     commander=commander,
                     land_count=land_count,
                     plan_profile=plan_profile,
                     strict_tribal=strict_tribal,
+                    negative_words=neg_words,
                 )
 
             self.signals.progress.emit("Building mana base…", 85)
@@ -3482,6 +3540,11 @@ class LeftPanel(QWidget):
         form.addWidget(SectionLabel("Strategy Keywords"))
         self.strategy_widget = StrategyWidget()
         form.addWidget(self.strategy_widget)
+
+        # ── Negative Bias ─────────────────────────────────────────────────
+        form.addWidget(SectionLabel("Negative Bias"))
+        self.neg_strategy_widget = StrategyWidget()
+        form.addWidget(self.neg_strategy_widget)
 
         form.addWidget(Divider())
 
@@ -3833,6 +3896,7 @@ class LeftPanel(QWidget):
     def _on_generate(self):
         arch = self.archetype_combo.currentData()
         strat = self.strategy_widget.get_strategy_string()
+        neg_strat = self.neg_strategy_widget.get_strategy_string()
         rarity = self.rarity_combo.currentData()
         seed = self.seed_spin.value() if self.seed_check.isChecked() else None
         no_evo = self.no_evolve_check.isChecked()
@@ -3856,6 +3920,7 @@ class LeftPanel(QWidget):
             "commander_name": commander_name,
             "archetype":      arch,
             "strategy":       strat,
+            "negative_strategy": neg_strat,
             "max_rarity":     rarity,
             "seed":           seed,
             "no_evolve":      no_evo,

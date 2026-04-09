@@ -2702,209 +2702,6 @@ TENSION_PAIR_WEIGHTS: list[tuple[str, str, int, int, float]] = [
     ("self_mill", "graveyard_hate", 4, 2, 1.5),
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KNOWN COMBO DATABASE
-# Explicit two- (or three-) card combinations that produce a win or an engine.
-# Each entry has:
-#   "pieces"   — frozenset of exact card names
-#   "type"     — "infinite_mana" | "instant_win" | "engine_loop" | "value_engine"
-#   "tags"     — synergy tags to add to both pieces so the plan system rewards them
-# When a deck contains one piece and the partner is in the candidate pool, the
-# partner receives a strong selection bonus.  Full combo = large fitness bonus.
-# ─────────────────────────────────────────────────────────────────────────────
-KNOWN_COMBOS: list[dict] = [
-    # ── Infinite mana ────────────────────────────────────────────────────────
-    {"pieces": frozenset({"Basalt Monolith", "Rings of Brighthearth"}),        "type": "infinite_mana"},
-    {"pieces": frozenset({"Grim Monolith", "Power Artifact"}),                 "type": "infinite_mana"},
-    {"pieces": frozenset({"Kinnan, Bonder Prodigy", "Basalt Monolith"}),       "type": "infinite_mana"},
-    {"pieces": frozenset({"Dramatic Reversal", "Isochron Scepter"}),           "type": "infinite_mana"},
-    {"pieces": frozenset({"Pemmin's Aura", "Zaxara, the Exemplary"}),          "type": "infinite_mana"},
-    {"pieces": frozenset({"Pemmin's Aura", "Freed from the Real"}),            "type": "infinite_mana"},
-    {"pieces": frozenset({"Training Grounds", "Maze of Ith"}),                 "type": "infinite_mana"},
-    {"pieces": frozenset({"Selvala, Heart of the Wilds", "Umbral Mantle"}),    "type": "infinite_mana"},
-    # ── Instant win ──────────────────────────────────────────────────────────
-    {"pieces": frozenset({"Sanguine Bond", "Exquisite Blood"}),                "type": "instant_win"},
-    {"pieces": frozenset({"Mikaeus, the Unhallowed", "Triskelion"}),           "type": "instant_win"},
-    {"pieces": frozenset({"Mikaeus, the Unhallowed", "Walking Ballista"}),     "type": "instant_win"},
-    {"pieces": frozenset({"Thassa's Oracle", "Tainted Pact"}),                 "type": "instant_win"},
-    {"pieces": frozenset({"Thassa's Oracle", "Demonic Consultation"}),         "type": "instant_win"},
-    {"pieces": frozenset({"Laboratory Maniac", "Demonic Consultation"}),       "type": "instant_win"},
-    {"pieces": frozenset({"Helm of Obedience", "Rest in Peace"}),              "type": "instant_win"},
-    {"pieces": frozenset({"Heliod, Sun-Crowned", "Walking Ballista"}),         "type": "instant_win"},
-    {"pieces": frozenset({"Persist", "Cauldron of Souls"}),                    "type": "instant_win"},
-    # ── Engine loops (repeatable value, not strictly infinite) ───────────────
-    {"pieces": frozenset({"Ashnod's Altar", "Grave Titan"}),                   "type": "engine_loop"},
-    {"pieces": frozenset({"Yawgmoth, Thran Physician", "Geralf's Messenger"}), "type": "engine_loop"},
-    {"pieces": frozenset({"Birthing Pod", "Eternal Witness"}),                 "type": "engine_loop"},
-    {"pieces": frozenset({"Sneak Attack", "Elvish Piper"}),                    "type": "engine_loop"},
-    {"pieces": frozenset({"Splinter Twin", "Pestermite"}),                     "type": "instant_win"},
-    {"pieces": frozenset({"Splinter Twin", "Deceiver Exarch"}),                "type": "instant_win"},
-    {"pieces": frozenset({"Kiki-Jiki, Mirror Breaker", "Deceiver Exarch"}),    "type": "instant_win"},
-    {"pieces": frozenset({"Kiki-Jiki, Mirror Breaker", "Pestermite"}),         "type": "instant_win"},
-    # ── Value engines ─────────────────────────────────────────────────────────
-    {"pieces": frozenset({"Food Chain", "Eternal Scourge"}),                   "type": "value_engine"},
-    {"pieces": frozenset({"Bolas's Citadel", "Sensei's Divining Top"}),        "type": "value_engine"},
-    {"pieces": frozenset({"Underworld Breach", "Brain Freeze"}),               "type": "instant_win"},
-    {"pieces": frozenset({"Necropotence", "Bolas's Citadel"}),                 "type": "value_engine"},
-]
-
-# Reverse index: card name → list of combos it belongs to
-_COMBO_INDEX: dict[str, list[dict]] = {}
-for _combo in KNOWN_COMBOS:
-    for _piece in _combo["pieces"]:
-        _COMBO_INDEX.setdefault(_piece, []).append(_combo)
-
-
-def combo_synergy_bonus(card_name: str, deck_names: list[str]) -> float:
-    """
-    Bonus for including a card that completes or partially assembles a known combo.
-    Partial assembly (partner is in deck) gives a strong pull; full completion adds more.
-    """
-    if card_name not in _COMBO_INDEX:
-        return 0.0
-    deck_set = set(deck_names)
-    bonus = 0.0
-    for combo in _COMBO_INDEX[card_name]:
-        other_pieces = combo["pieces"] - {card_name}
-        have = sum(1 for p in other_pieces if p in deck_set)
-        total_others = len(other_pieces)
-        if have > 0:
-            # Partial assembly: strong pull toward completion
-            completion = have / total_others
-            weight = 5.0 if combo["type"] == "instant_win" else 3.5
-            bonus += completion * weight
-    return bonus
-
-
-def combo_completeness_bonus(deck_names: list[str]) -> float:
-    """Fitness bonus for each fully assembled combo in the deck."""
-    deck_set = set(deck_names)
-    bonus = 0.0
-    for combo in KNOWN_COMBOS:
-        if all(p in deck_set for p in combo["pieces"]):
-            weight = 8.0 if combo["type"] == "instant_win" else (
-                6.0 if combo["type"] == "infinite_mana" else 4.0
-            )
-            bonus += weight
-    return bonus
-
-
-# Pattern-driven combo package templates.
-# These model "how combos are built" so cards can be selected co-dependently.
-COMBO_PACKAGE_TEMPLATES: list[dict] = [
-    {
-        "name": "infinite_mana_shell",
-        "required": {"mana_engine": 1, "untap_engine": 1, "mana_sink": 1},
-        "optional": {"tutor": 1, "cost_reduction": 1},
-        "weight": 4.2,
-    },
-    {
-        "name": "aristocrats_loop",
-        "required": {"sac_outlet": 1, "recursion_engine": 1, "death_payoff": 1},
-        "optional": {"token_maker": 1, "graveyard_enabler": 1},
-        "weight": 3.9,
-    },
-    {
-        "name": "spells_storm_loop",
-        "required": {"spells_enabler": 8, "cost_reduction": 1, "spells_payoff": 1},
-        "optional": {"draw": 2, "storm_engine": 1, "treasure_maker": 1},
-        "weight": 3.4,
-    },
-    {
-        "name": "blink_value_loop",
-        "required": {"blink_enabler": 1, "etb_trigger": 4},
-        "optional": {"ltb_trigger": 1, "draw": 1},
-        "weight": 2.2,
-    },
-]
-
-_COMBO_TEMPLATE_TAGS: frozenset[str] = frozenset(
-    tag
-    for tpl in COMBO_PACKAGE_TEMPLATES
-    for tag in set(tpl["required"]) | set(tpl.get("optional", {}))
-)
-
-
-def combo_template_progress(
-    tag_counts: Counter,
-) -> list[dict[str, object]]:
-    """Progress stats for each combo template under current tag counts."""
-    rows: list[dict[str, object]] = []
-    for tpl in COMBO_PACKAGE_TEMPLATES:
-        req: dict[str, int] = tpl["required"]
-        opt: dict[str, int] = tpl.get("optional", {})
-        req_ratio_sum = 0.0
-        req_ok = True
-        for tag, need in req.items():
-            have = float(tag_counts.get(tag, 0))
-            r = min(1.0, have / max(1, need))
-            req_ratio_sum += r
-            if have < need:
-                req_ok = False
-        req_ratio = req_ratio_sum / max(1, len(req))
-        opt_ratio = 0.0
-        if opt:
-            opt_ratio = sum(
-                min(1.0, float(tag_counts.get(tag, 0)) / max(1, need))
-                for tag, need in opt.items()
-            ) / len(opt)
-        score = req_ratio * 0.85 + opt_ratio * 0.15
-        rows.append(
-            {
-                "name": tpl["name"],
-                "required_met": bool(req_ok),
-                "score": float(score),
-                "weight": float(tpl["weight"]),
-                "required": req,
-                "optional": opt,
-            }
-        )
-    return rows
-
-
-def combo_template_delta_bonus(
-    card_tags: frozenset[str],
-    current_counts: Counter,
-) -> float:
-    """
-    Bonus for cards that increase combo template closure from current deck state.
-    Encourages co-dependent insertion of missing combo package pieces.
-    """
-    if not (card_tags & _COMBO_TEMPLATE_TAGS):
-        return 0.0
-    next_counts = Counter(current_counts)
-    for tag in card_tags:
-        next_counts[tag] += 1
-    before = combo_template_progress(current_counts)
-    after = combo_template_progress(next_counts)
-    bonus = 0.0
-    for b, a in zip(before, after):
-        delta = float(a["score"]) - float(b["score"])
-        if delta <= 0:
-            continue
-        bonus += delta * float(a["weight"]) * 2.2
-        if (not bool(b["required_met"])) and bool(a["required_met"]):
-            bonus += 1.8 * float(a["weight"])
-    return bonus
-
-
-def combo_template_deck_bonus(tag_counts: Counter) -> tuple[float, float]:
-    """
-    Return (bonus, orphan_penalty) for template completion quality at deck level.
-    """
-    rows = combo_template_progress(tag_counts)
-    bonus = 0.0
-    orphan_pen = 0.0
-    for row in rows:
-        score = float(row["score"])
-        weight = float(row["weight"])
-        if bool(row["required_met"]):
-            bonus += 1.8 * weight + score * 0.9
-        elif score >= 0.55:
-            bonus += score * weight * 0.45
-        elif score >= 0.20:
-            orphan_pen += (0.55 - score) * weight * 0.9
-    return bonus, orphan_pen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3098,7 +2895,7 @@ WIN_CONDITION_REGISTRY: list[dict] = [
     {
         "name": "infinite_combo",
         "description": "Assemble a known infinite/instant-win combo",
-        "check": "combo",   # special: checked against KNOWN_COMBOS
+        "check": "combo",
         "required_tags": frozenset(),
         "min_count": 0,
     },
@@ -3254,11 +3051,7 @@ def detect_win_conditions(
         notes = ""
 
         if wc["check"] == "combo":
-            for combo in KNOWN_COMBOS:
-                if all(p in deck_set for p in combo["pieces"]):
-                    available = True
-                    notes = f"Combo assembled: {', '.join(sorted(combo['pieces']))}"
-                    break
+            pass  # hardcoded combo database removed
         else:
             # Tags check: how many cards contribute to required tags?
             req_tags = wc["required_tags"]
@@ -3956,8 +3749,7 @@ def simulate_commander_goldfish(
         total_first_play += first_play_turn
         if commander_turn <= commander_cmc:
             on_curve += 1
-        combo_ready = any(row["required_met"] for row in combo_template_progress(seen_tags))
-        if any(seen_tags[a] > 0 and seen_tags[b] > 0 for a, b in synergy_pairs) or combo_ready:
+        if any(seen_tags[a] > 0 and seen_tags[b] > 0 for a, b in synergy_pairs):
             pair_assembled += 1
         seen_plus_hand = Counter(seen_tags)
         for card in hand:
@@ -4051,14 +3843,6 @@ def synergy_added_by_card(
         # Shared synergy categories (soft bonus)
         shared = card_tags & ex_tags
         score += len(shared) * 0.05
-
-    # Combo piece pull: bonus for cards that partially assemble a known combo
-    score += combo_synergy_bonus(card_name, deck_names)
-    deck_tag_counts: Counter = Counter()
-    for n in deck_names:
-        for t in tag_index.get(n, frozenset()):
-            deck_tag_counts[t] += 1
-    score += combo_template_delta_bonus(card_tags, deck_tag_counts)
 
     return score / max(len(deck_names), 1)
 
@@ -4160,11 +3944,6 @@ def deck_synergy_total(
         pair_score += 3.5
 
     pair_score += _narrow_mechanic_adjustment(flat_tags)
-
-    # Known combo completeness bonus — large reward for assembling full combos
-    pair_score += combo_completeness_bonus(deck_names)
-    tpl_bonus, tpl_orphan_pen = combo_template_deck_bonus(flat_tags)
-    pair_score += tpl_bonus - tpl_orphan_pen
 
     return tribe_score + pair_score
 
@@ -4728,6 +4507,7 @@ def select_nonlands(
     ignore_tribal: bool = False,
     edhrec_prior: dict[str, float] | None = None,
     edhrec_influence: float = 0.0,
+    negative_hint: str = "",
 ) -> list[dict]:
     """
     Curve-first card selection with role weighting and synergy awareness.
@@ -4830,29 +4610,49 @@ def select_nonlands(
 
     # ── Strategy bonus ────────────────────────────────────────────────────────
     _strat_matchers = build_strategy_matchers(strategy_words) if strategy_words else []
+    _neg_words = extract_strategy_terms(negative_hint) if negative_hint else []
+    _neg_matchers = build_strategy_matchers(_neg_words) if _neg_words else []
 
     def strat_bonus(card: dict) -> float:
-        if not _strat_matchers:
-            return 0.0
         type_line = card.get("type_line") or ""
         oracle = card.get("oracle_text") or ""
         name = card.get("name") or ""
-        matched_groups = strategy_match_groups(card, _strat_matchers)
+
+        # Positive bonus
         base = 0.0
-        for type_pat, oracle_pats, _w, _orig_words in _strat_matchers:
-            if type_pat and type_pat.search(type_line):
-                base += 3.0
-            elif any(p.search(oracle) for p in oracle_pats):
-                base += 1.5
-            elif type_pat and type_pat.search(name):
-                base += 0.5
-        # Coherence multiplier: a card satisfying N distinct user-entered keywords
-        # scores geometrically higher, pulling intersection cards strongly to the top.
-        # 1 keyword → 1.0x  |  2 → 1.7x  |  3 → 2.4x  |  4 → 3.1x
-        n = len(matched_groups)
-        if n >= 2:
-            base *= 1.0 + 0.7 * (n - 1)
-        return base
+        if _strat_matchers:
+            matched_groups = strategy_match_groups(card, _strat_matchers)
+            for type_pat, oracle_pats, _w, _orig_words in _strat_matchers:
+                if type_pat and type_pat.search(type_line):
+                    base += 3.0
+                elif any(p.search(oracle) for p in oracle_pats):
+                    base += 1.5
+                elif type_pat and type_pat.search(name):
+                    base += 0.5
+            # Coherence multiplier: a card satisfying N distinct user-entered keywords
+            # scores geometrically higher, pulling intersection cards strongly to the top.
+            # 1 keyword → 1.0x  |  2 → 1.7x  |  3 → 2.4x  |  4 → 3.1x
+            n = len(matched_groups)
+            if n >= 2:
+                base *= 1.0 + 0.7 * (n - 1)
+
+        # Negative penalty (mirror of positive bonus)
+        neg_penalty = 0.0
+        if _neg_matchers:
+            neg_matched_groups = strategy_match_groups(card, _neg_matchers)
+            for type_pat, oracle_pats, _w, _orig_words in _neg_matchers:
+                if type_pat and type_pat.search(type_line):
+                    neg_penalty += 3.0
+                elif any(p.search(oracle) for p in oracle_pats):
+                    neg_penalty += 1.5
+                elif type_pat and type_pat.search(name):
+                    neg_penalty += 0.5
+            # Apply same coherence multiplier to negative penalty
+            n = len(neg_matched_groups)
+            if n >= 2:
+                neg_penalty *= 1.0 + 0.7 * (n - 1)
+
+        return base - neg_penalty
 
     # ── Composite score ───────────────────────────────────────────────────────
     def composite(card: dict) -> float:
@@ -4945,20 +4745,8 @@ def select_nonlands(
         # (Strict tribal creature filtering is handled by hard pool exclusion
         # above — non-tribe creatures never reach composite() when enabled.)
 
-        # Combo pool pull: if this card is a known combo piece and its partner
-        # exists in the candidate pool, give a pre-selection bonus so both pieces
-        # tend to land in the deck before evolutionary refinement.
-        card_name_for_combo = card.get("name", "")
-        if card_name_for_combo in _COMBO_INDEX:
-            for _cmb in _COMBO_INDEX[card_name_for_combo]:
-                _partners = _cmb["pieces"] - {card_name_for_combo}
-                if _partners.issubset(_pool_names):
-                    _w = 3.5 if _cmb["type"] == "instant_win" else 2.5
-                    struct_pen += _w
         if archetype == "combo":
-            if card_tags & _COMBO_TEMPLATE_TAGS:
-                struct_pen += 0.9
-            elif get_cmc(card) >= 5 and "wincon" not in roles and "draw" not in roles and "tutor" not in roles:
+            if get_cmc(card) >= 5 and "wincon" not in roles and "draw" not in roles and "tutor" not in roles:
                 struct_pen -= 0.6
         if _edhrec_influence > 0.0:
             prior = _edhrec_prior.get(card.get("name", ""), None)
@@ -5176,14 +4964,6 @@ def select_nonlands(
         if len(selected_names) >= max(10, nonland_slots // 2):
             if any(t in card_tags for t in finisher_tags):
                 bonus += 1.5
-        combo_delta = combo_template_delta_bonus(card_tags, selected_tag_counts)
-        if combo_delta > 0:
-            combo_scale = 1.25 if archetype == "combo" else 1.0
-            bonus += min(6.0, combo_delta * combo_scale)
-        elif archetype == "combo" and (card_tags & _COMBO_TEMPLATE_TAGS):
-            # Combo archetypes should avoid random orphan pieces that don't
-            # improve any active template.
-            bonus -= 1.2
         if _edhrec_influence > 0.0:
             prior = _edhrec_prior.get(card_name, None)
             if prior is not None:
@@ -5564,6 +5344,7 @@ def deck_fitness(
     commander: dict | None = None,
     land_count: int | None = None,
     plan_profile: dict[str, object] | None = None,
+    negative_words: list[str] | None = None,
 ) -> float:
     """Aggregate fitness function combining power, archetype fit, synergy, curve, and strategy."""
     cfg = ARCHETYPE_CONFIG[archetype]
@@ -5605,6 +5386,11 @@ def deck_fitness(
     strat_coherence_score = 0.0
     strat_intersection_score = 0.0
     off_strategy_rate = 1.0
+    on_negative_rate = 0.0
+    strat_coherence_score = 0.0
+    strat_intersection_score = 0.0
+    neg_coherence_score = 0.0
+
     if strategy_words:
         matchers = build_strategy_matchers(strategy_words)
         strat_metrics = strategy_coherence_metrics(cards, matchers)
@@ -5612,6 +5398,33 @@ def deck_fitness(
         strat_coherence_score = strat_metrics["coherence"]
         strat_intersection_score = strat_metrics["intersection_rate"]
         off_strategy_rate = strat_metrics["off_strategy_rate"]
+
+    neg_penalty_per_deck = 0.0
+    if negative_words:
+        neg_matchers = build_strategy_matchers(negative_words)
+        neg_metrics = strategy_coherence_metrics(cards, neg_matchers)
+        on_negative_rate = neg_metrics["match_rate"]
+        neg_coherence_score = neg_metrics["coherence"]
+
+        # Per-card negative penalty: sum up individual card penalties for matching negative keywords
+        for card in cards:
+            card_neg_penalty = 0.0
+            type_line = card.get("type_line") or ""
+            oracle = card.get("oracle_text") or ""
+            name = card.get("name") or ""
+            for type_pat, oracle_pats, _w, _orig_words in neg_matchers:
+                if type_pat and type_pat.search(type_line):
+                    card_neg_penalty += 3.0
+                elif any(p.search(oracle) for p in oracle_pats):
+                    card_neg_penalty += 1.5
+                elif type_pat and type_pat.search(name):
+                    card_neg_penalty += 0.5
+            # Apply coherence multiplier if card matches multiple negative keywords
+            matched_neg_groups = strategy_match_groups(card, neg_matchers)
+            n = len(matched_neg_groups)
+            if n >= 2:
+                card_neg_penalty *= 1.0 + 0.7 * (n - 1)
+            neg_penalty_per_deck += card_neg_penalty
 
     # Orphaned payoff penalty: payoff cards with no matching enablers in the deck
     # reduces fitness — the evolutionary phase will tend to replace them
@@ -5630,7 +5443,7 @@ def deck_fitness(
         if n_payoff > 0 and n_enabler == 0:
             # Scale penalty: 0.4 per orphaned payoff card, min penalty of 1.0
             orphan_penalty += max(1.0, n_payoff * 0.4)
-    combo_package_bonus, combo_orphan_penalty = combo_template_deck_bonus(flat_tags)
+    combo_package_bonus, combo_orphan_penalty = 0.0, 0.0
 
     # Change 1: named-card dependency penalty — cards that name absent cards
     _deck_name_set: frozenset[str] = frozenset(c.get("name", "") for c in cards)
@@ -5750,20 +5563,13 @@ def deck_fitness(
     offplan_allowance = max(6, len(cards) // 5)
     if offplan_hits > offplan_allowance:
         plan_penalty += (offplan_hits - offplan_allowance) * 0.22
-    if archetype == "combo":
-        combo_rows = combo_template_progress(flat_tags)
-        completed_templates = sum(1 for row in combo_rows if row["required_met"])
-        known_combos_complete = sum(
-            1 for combo in KNOWN_COMBOS if all(piece in names for piece in combo["pieces"])
-        )
-        if completed_templates <= 0 and known_combos_complete <= 0:
-            plan_penalty += 3.2
-        elif completed_templates == 1 and known_combos_complete <= 0:
-            plan_penalty += 1.4
     plan_penalty += max(0.0, 0.72 - archetype_coherence) * 6.0
     if strategy_words:
         plan_penalty += max(0.0, off_strategy_rate - 0.28) * 7.5
         plan_penalty += max(0.0, 0.45 - strat_coherence_score) * 3.5
+    if negative_words:
+        # Apply per-card negative penalty computed above, normalized to deck size
+        plan_penalty += neg_penalty_per_deck / max(len(cards), 1)
     if allowed_package_tags:
         package_hits = sum(1 for c in cards if tag_index.get(c["name"], frozenset()) & allowed_package_tags)
         if package_hits < max(14, len(cards) // 3):
@@ -5947,6 +5753,7 @@ def evolutionary_refine(
     land_count: int | None = None,
     plan_profile: dict[str, object] | None = None,
     strict_tribal: bool = False,
+    negative_words: list[str] | None = None,
 ) -> list[dict]:
     """Mutation-based evolutionary refinement with limited exploratory moves."""
     current = list(nonlands)
@@ -5958,6 +5765,7 @@ def evolutionary_refine(
     current_fitness = deck_fitness(
         current, db, tag_index, archetype, strategy_words,
         commander=commander, land_count=land_count, plan_profile=plan_profile,
+        negative_words=negative_words,
     )
     best = list(current)
     best_fitness = current_fitness
@@ -6017,6 +5825,11 @@ def evolutionary_refine(
             base -= req_penalty
         # (Non-tribe creatures are excluded from eligible_pool when strict_tribal
         # is active, so no per-card penalty is needed here.)
+        if _evo_matchers:
+            _matched_pkg = strategy_match_groups(c, _evo_matchers)
+            _n_pkg = len(_matched_pkg)
+            if _n_pkg >= 2:
+                base += 4.0 + 1.5 * (_n_pkg - 2)
         return base
 
     def dynamic_theme_bonus(
@@ -6063,6 +5876,11 @@ def evolutionary_refine(
                 bonus += strategy_base * (strategy_blend - 1.0)
             else:
                 bonus -= 1.0
+        if _evo_matchers:
+            _matched_pkg = strategy_match_groups(c, _evo_matchers)
+            _n_pkg = len(_matched_pkg)
+            if _n_pkg >= 2:
+                bonus += 3.0 * (_n_pkg - 1)
         return bonus
 
     base_candidate_scores: dict[str, float] = {
@@ -6144,6 +5962,7 @@ def evolutionary_refine(
         new_fitness = deck_fitness(
             new_deck, db, tag_index, archetype, strategy_words,
             commander=commander, land_count=land_count, plan_profile=plan_profile,
+            negative_words=negative_words,
         )
 
         accept = new_fitness > current_fitness
@@ -6289,10 +6108,9 @@ def deck_validity_report(
     _support_bonus, _tension_penalty = interaction_support_tension_adjustment(flat_tags, _rb)
     _pp = plan_profile or infer_commander_plan(commander) if commander is not None else {}
     structural_tribes = _infer_structural_tribes(flat_tags, subtype_counts, _pp)
-    combo_rows = combo_template_progress(flat_tags)
-    combo_templates_completed = sum(1 for row in combo_rows if row["required_met"])
-    combo_templates_partial = sum(1 for row in combo_rows if (not row["required_met"]) and float(row["score"]) >= 0.45)
-    _combo_bonus, combo_orphan_penalty = combo_template_deck_bonus(flat_tags)
+    combo_templates_completed = 0
+    combo_templates_partial = 0
+    combo_orphan_penalty = 0.0
     token_structural_mismatch = 0
     token_untyped_in_tribal = 0
     if structural_tribes:
@@ -6407,6 +6225,7 @@ def generate_commander_candidates(
         fitness = deck_fitness(
             candidate, db, tag_index, archetype, strat_words,
             commander=commander, land_count=land_count, plan_profile=plan_profile,
+            negative_words=negative_words,
         )
         shape = deck_shape_signature(candidate, tag_index)
         prev = archive.get(shape)
