@@ -1864,6 +1864,8 @@ def detect_synergy_tags(card: dict) -> frozenset[str]:
         tags.add("spells_payoff")
     if is_instant_or_sorcery(card):
         tags.add("spells_enabler")
+    if re.search(r"copy target (?:instant|sorcery) spell|whenever you cast (?:an? )?(?:instant|sorcery).{0,50}copy", oracle):
+        tags.add("storm_engine")
 
     # Graveyard
     gy_keywords = {"flashback", "escape", "unearth", "delve", "threshold", "delirium",
@@ -1886,6 +1888,13 @@ def detect_synergy_tags(card: dict) -> frozenset[str]:
         )
     ):
         tags.add("graveyard_enabler")
+    if re.search(
+        r"cast .* from your graveyard|play .* from your graveyard"
+        r"|return target .* from your graveyard to the battlefield"
+        r"|whenever .{0,40} dies, return .* from your graveyard",
+        oracle,
+    ):
+        tags.add("recursion_engine")
 
     # Self-mill: specifically moves cards from your LIBRARY to graveyard.
     # Distinct from graveyard_enabler (which includes discard/loot) — Muldrotha
@@ -1956,6 +1965,25 @@ def detect_synergy_tags(card: dict) -> frozenset[str]:
         tags.add("sac_outlet")
     if re.search(rf"when(?:ever)? .{{0,60}} {_DIES_RE}", oracle):
         tags.add("death_trigger")
+    if re.search(rf"whenever .{{0,60}} {_DIES_RE}.{{0,50}}(each opponent loses|you gain|create|draw)", oracle):
+        tags.add("death_payoff")
+
+    # Combo primitives (generalized, theory-driven)
+    if re.search(r"untap target (?:artifact|creature|land|permanent)|untap all (?:artifacts|creatures|lands|permanents)", oracle):
+        tags.add("untap_engine")
+    if (
+        ("{t}: add" in oracle and "Land" not in type_line)
+        or re.search(r"add [x0-9{]/ ]+mana", oracle)
+        or re.search(r"add x mana", oracle)
+    ):
+        tags.add("mana_engine")
+    if re.search(
+        r"\{x\}|where x is|:\s*(?:draw|deal|create|target player loses|mill|exile the top|scry)",
+        oracle,
+    ):
+        tags.add("mana_sink")
+    if any(t in tags for t in ("untap_engine", "mana_engine", "mana_sink", "recursion_engine", "death_payoff", "storm_engine")):
+        tags.add("combo_piece")
 
     # Artifacts
     if "artifact" in type_line:
@@ -2351,6 +2379,9 @@ _NAMED_CARD_RE = re.compile(
     r'\bnamed\s+"?([A-Z][A-Za-z\' ,\-]+?)"?'
     r'(?=\s*[,.\)]|\s+(?:is|are|that|which|you|in|on|to|from|with|when|if|and)\b)',
 )
+_PARTNER_WITH_RE = re.compile(
+    r"\bpartner with\s+([A-Z][A-Za-z' ,\-]+?)(?=\s*[,.\)]|\s|$)"
+)
 
 
 def extract_named_dependencies(card: dict) -> frozenset[str]:
@@ -2361,7 +2392,11 @@ def extract_named_dependencies(card: dict) -> frozenset[str]:
     from the deck, the card incurs a scoring penalty.
     """
     oracle = card.get("oracle_text") or ""
-    return frozenset(m.group(1).strip() for m in _NAMED_CARD_RE.finditer(oracle))
+    named = {m.group(1).strip() for m in _NAMED_CARD_RE.finditer(oracle)}
+    # Commander-specific paired legends ("partner with X") are effectively
+    # named dependencies in singleton 99 when the pair is absent.
+    named.update(m.group(1).strip() for m in _PARTNER_WITH_RE.finditer(oracle))
+    return frozenset(named)
 
 
 # Synergy pair relationships: (source_tag, target_tag) — having both in a deck is good
@@ -2512,6 +2547,124 @@ def combo_completeness_bonus(deck_names: list[str]) -> float:
             )
             bonus += weight
     return bonus
+
+
+# Pattern-driven combo package templates.
+# These model "how combos are built" so cards can be selected co-dependently.
+COMBO_PACKAGE_TEMPLATES: list[dict] = [
+    {
+        "name": "infinite_mana_shell",
+        "required": {"mana_engine": 1, "untap_engine": 1, "mana_sink": 1},
+        "optional": {"tutor": 1, "cost_reduction": 1},
+        "weight": 4.2,
+    },
+    {
+        "name": "aristocrats_loop",
+        "required": {"sac_outlet": 1, "recursion_engine": 1, "death_payoff": 1},
+        "optional": {"token_maker": 1, "graveyard_enabler": 1},
+        "weight": 3.9,
+    },
+    {
+        "name": "spells_storm_loop",
+        "required": {"spells_enabler": 8, "cost_reduction": 1, "spells_payoff": 1},
+        "optional": {"draw": 2, "storm_engine": 1, "treasure_maker": 1},
+        "weight": 3.4,
+    },
+    {
+        "name": "blink_value_loop",
+        "required": {"blink_enabler": 1, "etb_trigger": 4},
+        "optional": {"ltb_trigger": 1, "draw": 1},
+        "weight": 2.2,
+    },
+]
+
+_COMBO_TEMPLATE_TAGS: frozenset[str] = frozenset(
+    tag
+    for tpl in COMBO_PACKAGE_TEMPLATES
+    for tag in set(tpl["required"]) | set(tpl.get("optional", {}))
+)
+
+
+def combo_template_progress(
+    tag_counts: Counter,
+) -> list[dict[str, object]]:
+    """Progress stats for each combo template under current tag counts."""
+    rows: list[dict[str, object]] = []
+    for tpl in COMBO_PACKAGE_TEMPLATES:
+        req: dict[str, int] = tpl["required"]
+        opt: dict[str, int] = tpl.get("optional", {})
+        req_ratio_sum = 0.0
+        req_ok = True
+        for tag, need in req.items():
+            have = float(tag_counts.get(tag, 0))
+            r = min(1.0, have / max(1, need))
+            req_ratio_sum += r
+            if have < need:
+                req_ok = False
+        req_ratio = req_ratio_sum / max(1, len(req))
+        opt_ratio = 0.0
+        if opt:
+            opt_ratio = sum(
+                min(1.0, float(tag_counts.get(tag, 0)) / max(1, need))
+                for tag, need in opt.items()
+            ) / len(opt)
+        score = req_ratio * 0.85 + opt_ratio * 0.15
+        rows.append(
+            {
+                "name": tpl["name"],
+                "required_met": bool(req_ok),
+                "score": float(score),
+                "weight": float(tpl["weight"]),
+                "required": req,
+                "optional": opt,
+            }
+        )
+    return rows
+
+
+def combo_template_delta_bonus(
+    card_tags: frozenset[str],
+    current_counts: Counter,
+) -> float:
+    """
+    Bonus for cards that increase combo template closure from current deck state.
+    Encourages co-dependent insertion of missing combo package pieces.
+    """
+    if not (card_tags & _COMBO_TEMPLATE_TAGS):
+        return 0.0
+    next_counts = Counter(current_counts)
+    for tag in card_tags:
+        next_counts[tag] += 1
+    before = combo_template_progress(current_counts)
+    after = combo_template_progress(next_counts)
+    bonus = 0.0
+    for b, a in zip(before, after):
+        delta = float(a["score"]) - float(b["score"])
+        if delta <= 0:
+            continue
+        bonus += delta * float(a["weight"]) * 2.2
+        if (not bool(b["required_met"])) and bool(a["required_met"]):
+            bonus += 1.8 * float(a["weight"])
+    return bonus
+
+
+def combo_template_deck_bonus(tag_counts: Counter) -> tuple[float, float]:
+    """
+    Return (bonus, orphan_penalty) for template completion quality at deck level.
+    """
+    rows = combo_template_progress(tag_counts)
+    bonus = 0.0
+    orphan_pen = 0.0
+    for row in rows:
+        score = float(row["score"])
+        weight = float(row["weight"])
+        if bool(row["required_met"]):
+            bonus += 1.8 * weight + score * 0.9
+        elif score >= 0.55:
+            bonus += score * weight * 0.45
+        elif score >= 0.20:
+            orphan_pen += (0.55 - score) * weight * 0.9
+    return bonus, orphan_pen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2988,6 +3141,7 @@ LIABILITY_WEIGHTS: dict[str, float] = {
     "lose_game": 8.0,
     "exile_library": 6.0,
     "self_wipe": 5.0,
+    "commander_niche": 1.4,
 }
 
 
@@ -3107,6 +3261,34 @@ def _support_rule_adjustment(
     return adj
 
 
+def _support_gap_card_adjustment(
+    tag_counts: Counter,
+    card_tags: frozenset[str],
+) -> float:
+    """
+    Selection-time pressure to CLOSE active support gaps and avoid adding
+    additional unsupported payoffs.
+    """
+    adj = 0.0
+    rules = tuple(SUPPORT_VALIDATION_RULES.values()) + tuple(NARROW_MECHANIC_RULES.values())
+    for rule in rules:
+        support_tags = rule["support_tags"]
+        payoff_tags = rule["payoff_tags"]
+        min_support = int(rule["min_support"])
+        payoff = sum(int(tag_counts.get(tag, 0)) for tag in payoff_tags)
+        if payoff <= 0:
+            continue
+        support = sum(int(tag_counts.get(tag, 0)) for tag in support_tags)
+        missing = max(0, min_support - support)
+        if missing <= 0:
+            continue
+        if card_tags & support_tags:
+            adj += min(3.0, 0.55 * missing + 0.10 * payoff)
+        if (card_tags & payoff_tags) and not (card_tags & support_tags):
+            adj -= min(2.4, 0.45 * missing + 0.08 * payoff)
+    return adj
+
+
 def detect_liability_flags(card: dict) -> frozenset[str]:
     oracle = (card.get("oracle_text") or "").lower()
     flags: set[str] = set()
@@ -3138,6 +3320,8 @@ def detect_liability_flags(card: dict) -> frozenset[str]:
         flags.add("lose_game")
     if re.search(r"exile all cards from your library|exile your library|your library becomes your graveyard", oracle):
         flags.add("exile_library")
+    if re.search(r"choose a background|doctor.s companion|friends forever", oracle):
+        flags.add("commander_niche")
     return frozenset(flags)
 
 
@@ -3532,7 +3716,8 @@ def simulate_commander_goldfish(
         total_first_play += first_play_turn
         if commander_turn <= commander_cmc:
             on_curve += 1
-        if any(seen_tags[a] > 0 and seen_tags[b] > 0 for a, b in synergy_pairs):
+        combo_ready = any(row["required_met"] for row in combo_template_progress(seen_tags))
+        if any(seen_tags[a] > 0 and seen_tags[b] > 0 for a, b in synergy_pairs) or combo_ready:
             pair_assembled += 1
         seen_plus_hand = Counter(seen_tags)
         for card in hand:
@@ -3629,6 +3814,11 @@ def synergy_added_by_card(
 
     # Combo piece pull: bonus for cards that partially assemble a known combo
     score += combo_synergy_bonus(card_name, deck_names)
+    deck_tag_counts: Counter = Counter()
+    for n in deck_names:
+        for t in tag_index.get(n, frozenset()):
+            deck_tag_counts[t] += 1
+    score += combo_template_delta_bonus(card_tags, deck_tag_counts)
 
     return score / max(len(deck_names), 1)
 
@@ -3733,6 +3923,8 @@ def deck_synergy_total(
 
     # Known combo completeness bonus — large reward for assembling full combos
     pair_score += combo_completeness_bonus(deck_names)
+    tpl_bonus, tpl_orphan_pen = combo_template_deck_bonus(flat_tags)
+    pair_score += tpl_bonus - tpl_orphan_pen
 
     return tribe_score + pair_score
 
@@ -4519,6 +4711,11 @@ def select_nonlands(
                 if _partners.issubset(_pool_names):
                     _w = 3.5 if _cmb["type"] == "instant_win" else 2.5
                     struct_pen += _w
+        if archetype == "combo":
+            if card_tags & _COMBO_TEMPLATE_TAGS:
+                struct_pen += 0.9
+            elif get_cmc(card) >= 5 and "wincon" not in roles and "draw" not in roles and "tutor" not in roles:
+                struct_pen -= 0.6
 
         # Change 3: quality gate — low-power cards get diminished strategy bonus
         # so a keyword match on a bad card can't drag it into the deck.
@@ -4731,6 +4928,14 @@ def select_nonlands(
         if len(selected_names) >= max(10, nonland_slots // 2):
             if any(t in card_tags for t in finisher_tags):
                 bonus += 1.5
+        combo_delta = combo_template_delta_bonus(card_tags, selected_tag_counts)
+        if combo_delta > 0:
+            combo_scale = 1.25 if archetype == "combo" else 1.0
+            bonus += min(6.0, combo_delta * combo_scale)
+        elif archetype == "combo" and (card_tags & _COMBO_TEMPLATE_TAGS):
+            # Combo archetypes should avoid random orphan pieces that don't
+            # improve any active template.
+            bonus -= 1.2
         bonus += _slot_pressure_adjustment(card, contributes_unmet, pressure_mix, unresolved_ratio)
         # Synergy density: a card that touches multiple plan tags simultaneously
         # is worth more than two single-hit cards — reward multiplicative coverage.
@@ -4892,6 +5097,9 @@ def select_nonlands(
         if isinstance(max_avg_cmc, (int, float)) and current_avg_cmc > float(max_avg_cmc) + 0.15:
             overflow = current_avg_cmc - float(max_avg_cmc)
             bonus -= overflow * 2.8
+        # Close active support gaps (e.g., if payoffs are present but enabling
+        # shell is under target, prioritize support over more orphan payoffs).
+        bonus += _support_gap_card_adjustment(selected_tag_counts, card_tags)
         return bonus
 
     # ── Phase -1: Infrastructure reservation ──────────────────────────────────
@@ -5170,6 +5378,7 @@ def deck_fitness(
         if n_payoff > 0 and n_enabler == 0:
             # Scale penalty: 0.4 per orphaned payoff card, min penalty of 1.0
             orphan_penalty += max(1.0, n_payoff * 0.4)
+    combo_package_bonus, combo_orphan_penalty = combo_template_deck_bonus(flat_tags)
 
     # Change 1: named-card dependency penalty — cards that name absent cards
     _deck_name_set: frozenset[str] = frozenset(c.get("name", "") for c in cards)
@@ -5289,6 +5498,16 @@ def deck_fitness(
     offplan_allowance = max(6, len(cards) // 5)
     if offplan_hits > offplan_allowance:
         plan_penalty += (offplan_hits - offplan_allowance) * 0.22
+    if archetype == "combo":
+        combo_rows = combo_template_progress(flat_tags)
+        completed_templates = sum(1 for row in combo_rows if row["required_met"])
+        known_combos_complete = sum(
+            1 for combo in KNOWN_COMBOS if all(piece in names for piece in combo["pieces"])
+        )
+        if completed_templates <= 0 and known_combos_complete <= 0:
+            plan_penalty += 3.2
+        elif completed_templates == 1 and known_combos_complete <= 0:
+            plan_penalty += 1.4
     plan_penalty += max(0.0, 0.72 - archetype_coherence) * 6.0
     if strategy_words:
         plan_penalty += max(0.0, off_strategy_rate - 0.28) * 7.5
@@ -5422,10 +5641,12 @@ def deck_fitness(
             + support_adjustment
             + redundancy_bonus
             + pair_support_bonus
+            + combo_package_bonus
             + archetype_coherence * 1.8
             + engine_flow_score
             + win_con_score
             - orphan_penalty
+            - combo_orphan_penalty
             - named_dep_penalty
             - liability_cost
             - requirement_penalty
@@ -5445,10 +5666,12 @@ def deck_fitness(
         + support_adjustment
         + redundancy_bonus
         + pair_support_bonus
+        + combo_package_bonus
         + archetype_coherence * 1.8
         + engine_flow_score
         + win_con_score
         - orphan_penalty
+        - combo_orphan_penalty
         - named_dep_penalty
         - liability_cost
         - requirement_penalty
@@ -5814,6 +6037,10 @@ def deck_validity_report(
     _support_bonus, _tension_penalty = interaction_support_tension_adjustment(flat_tags, _rb)
     _pp = plan_profile or infer_commander_plan(commander) if commander is not None else {}
     structural_tribes = _infer_structural_tribes(flat_tags, subtype_counts, _pp)
+    combo_rows = combo_template_progress(flat_tags)
+    combo_templates_completed = sum(1 for row in combo_rows if row["required_met"])
+    combo_templates_partial = sum(1 for row in combo_rows if (not row["required_met"]) and float(row["score"]) >= 0.45)
+    _combo_bonus, combo_orphan_penalty = combo_template_deck_bonus(flat_tags)
     token_structural_mismatch = 0
     token_untyped_in_tribal = 0
     if structural_tribes:
@@ -5847,6 +6074,9 @@ def deck_validity_report(
         "missing_named_dependencies": named_dependency_miss_count,
         "orphan_payoff_count": orphan_payoff_count,
         "support_gap_count": support_gap_count,
+        "combo_templates_completed": combo_templates_completed,
+        "combo_templates_partial": combo_templates_partial,
+        "combo_orphan_penalty": round(float(combo_orphan_penalty), 3),
         "token_structural_mismatch": token_structural_mismatch,
         "token_untyped_in_tribal": token_untyped_in_tribal,
         "tension_penalty": round(float(_tension_penalty), 3),

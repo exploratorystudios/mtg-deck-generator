@@ -2880,7 +2880,7 @@ class GeneratorWorker(QThread):
             seed      = p["seed"]
             no_evo    = p["no_evolve"]
             gens      = p["generations"]
-            diversity = p.get("diversity", 1.0)
+            diversity = p.get("diversity", 0.0)
 
             if seed is not None:
                 random.seed(seed)
@@ -3041,7 +3041,7 @@ class BrawlGeneratorWorker(QThread):
             seed           = p["seed"]
             no_evo         = p["no_evolve"]
             gens           = p["generations"]
-            diversity      = p.get("diversity", 1.0)
+            diversity      = p.get("diversity", 0.0)
             commander_name = p["commander_name"]
             strict_tribal  = p.get("strict_tribal", False)
             strict_tribal_type = p.get("strict_tribal_type") or None
@@ -3204,7 +3204,7 @@ class CommanderGeneratorWorker(QThread):
             seed           = p["seed"]
             no_evo         = p["no_evolve"]
             gens           = p["generations"]
-            diversity      = p.get("diversity", 1.0)
+            diversity      = p.get("diversity", 0.0)
             commander_name = p["commander_name"]
             strict_tribal  = p.get("strict_tribal", False)
             strict_tribal_type = p.get("strict_tribal_type") or None
@@ -3645,13 +3645,13 @@ class LeftPanel(QWidget):
         self.div_spin = QDoubleSpinBox()
         self.div_spin.setRange(0.0, 3.0)
         self.div_spin.setSingleStep(0.1)
-        self.div_spin.setValue(1.0)
+        self.div_spin.setValue(0.0)
         self.div_spin.setDecimals(1)
         self.div_spin.setFixedWidth(60)
         self.div_spin.installEventFilter(_wheel_filter)
         self.div_spin.setToolTip(
             "0.0 = fully deterministic (same seed → same deck)\n"
-            "1.0 = balanced variety (default)\n"
+            "1.0 = balanced variety\n"
             "3.0 = highly varied — different cards each run"
         )
         div_hint = QLabel("0 = deterministic · 3 = highly varied")
@@ -3671,7 +3671,7 @@ class LeftPanel(QWidget):
         cand_lbl.setStyleSheet("color: #8b949e; font-size: 12px; min-width: 80px;")
         self.candidate_spin = QSpinBox()
         self.candidate_spin.setRange(1, 20)
-        self.candidate_spin.setValue(6)
+        self.candidate_spin.setValue(1)
         self.candidate_spin.installEventFilter(_wheel_filter)
         self.candidate_spin.setToolTip(
             "How many different deck shapes to explore before choosing the best one.\n"
