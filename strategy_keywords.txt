@@ -1,0 +1,170 @@
+MTG Commander Generator Strategy Keywords
+========================================
+
+This file lists the strategy keywords currently accepted by
+`deck_generator_commander.py` and also includes the existing GUI preset
+keywords from `mtg_gui.py` as examples.
+
+
+Canonical Strategy Keywords
+---------------------------
+
+aristocrats
+artifacts
+auras
+blink
+bounce
+burn
+copy
+counter
+counters
+creatures
+damage
+discard
+drain
+draw
+enchantments
+equipment
+etb
+evasion
+flicker
+graveyard
+infinite
+instants
+interaction
+lifegain
+looting
+lords
+mill
+planeswalkers
+proliferate
+protection
+prowess
+ramp
+reanimation
+reanimator
+recursion
+removal
+sacrifice
+sorceries
+spells
+stax
+stickers
+storm
+tempo
+theft
+tokens
+tutor
+vehicles
+voltron
+
+
+Accepted Phrase Aliases
+-----------------------
+
+go wide
+go-wide
+group slug
+group-slug
+card advantage
+mana advantage
+tempo advantage
+
+
+Accepted Internal-Style Aliases
+-------------------------------
+
+go_wide
+group_slug
+card_advantage
+mana_advantage
+tempo_advantage
+death_trigger
+keyword_grant
+voltron_enabler
+
+
+GUI Preset Examples
+-------------------
+
+These are the preset strategy chips currently exposed in `mtg_gui.py`.
+They are useful examples of what users can type, even when some of them are
+broader UI labels rather than the strongest canonical internal keyword.
+
+Tribes:
+angels
+birds
+cats
+clerics
+demons
+dinosaurs
+dragons
+elves
+faeries
+giants
+goblins
+humans
+insects
+knights
+merfolk
+monks
+ninjas
+pirates
+raccoons
+rogues
+samurai
+shamans
+snakes
+soldiers
+spirits
+vampires
+warriors
+wizards
+zombies
+
+Mechanics:
+artifacts
+enchantments
+equipment
+vehicles
+flashback
+escape
+unearth
+jump-start
+retrace
+tokens
+sacrifice
+graveyard
+reanimator
+spells
+prowess
+storm
+cascade
+counters
+proliferate
+energy
+stickers
+landfall
+cycling
+madness
+convoke
+improvise
+burn
+mill
+lifegain
+discard
+ramp
+
+Synergies:
+blink
+copy
+etb
+extra turns
+haste
+hexproof
+infinite
+looting
+protection
+recursion
+theft
+tempo
